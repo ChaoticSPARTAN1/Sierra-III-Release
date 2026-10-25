@@ -1,0 +1,11 @@
+# The bake's Python libraries, pinned to releases with ready-made packages
+# (wheels) for every Python from 3.9 to 3.14 on Windows (x86-64), macOS (Apple
+# silicon and Intel) and Linux (x86-64). No single numpy or shapely release
+# covers all six Pythons, hence the markers. launcher.py installs these with
+# --only-binary, so nothing is ever compiled on the player's machine.
+numpy==2.0.2; python_version < "3.10"
+numpy==2.2.6; python_version == "3.10"
+numpy==2.3.4; python_version >= "3.11"
+pillow==11.3.0
+shapely==2.0.7; python_version < "3.10"
+shapely==2.1.2; python_version >= "3.10"

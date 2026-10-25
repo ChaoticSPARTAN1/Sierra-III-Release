@@ -1,0 +1,76 @@
+# ---------------------------------------------------------------------------
+# Sierra-III: what never goes into this repository
+# ---------------------------------------------------------------------------
+
+# 1. Game data. Nothing that comes from the game files, ever: no maps, no
+#    extracted tags, no baked packs. Everyone bakes their own from their own
+#    disc with bake/halo-psp-bake.
+*.map
+*.pgeo
+*.ptex
+*.pstn
+*.adp
+*.vram
+*.xbe
+*.iso
+*.bik
+*.xmv
+*.wma
+*.xma
+/maps/
+/tags/
+*_tags/
+tags_*/
+**/halo/maps/
+# Tag files by extension (what Invader or the HEK extract)
+*.bitmap
+*.sound
+*.scenario
+*.scenario_structure_bsp
+*.gbxmodel
+*.model_animations
+*.model_collision_geometry
+*.shader_*
+*.unicode_string_list
+*.font
+# Audio clipped from the game's music (e.g. for the XMB's SND0). Keep these
+# local and pack them with PSP_XMB_SND0; see psp/xmb/README.md.
+*.at3
+*.AT3
+/psp/xmb/local/
+
+# 2. Build output. psp_build.py regenerates all of it.
+/build/
+**/build/
+**/build2/
+*.o
+*.a
+*.elf
+*.prx
+*.PBP
+*.SFO
+*.map.txt
+halo.map
+/link/objs.rsp
+/link/stubs.c
+/link/stubbed_symbols.txt
+
+# 3. Firmware or other third-party binaries (never ours to publish).
+flash0/
+*.bin
+
+# 4. Hardware logs and emulator runs: never committed.
+/logs/
+/runs/
+*.tgz
+*.zip
+# ...but the profile-guided build's counts are ours (counts of this code's
+# branches, no game data): psp_build.py reads them from pgo/
+!/pgo/*.tgz
+
+# 5. Python and editor clutter.
+__pycache__/
+*.pyc
+.venv/
+*.swp
+.DS_Store

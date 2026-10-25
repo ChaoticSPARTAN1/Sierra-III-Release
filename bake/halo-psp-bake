@@ -1,0 +1,168 @@
+#!/bin/sh
+# The bake's command on Linux and macOS (Windows has halo-psp-bake.cmd). The
+# bundle names it for the player: bake-halo.sh on Linux, "Bake Halo.command"
+# on macOS. Double-clicked (no arguments), it runs the guided bake
+# (guided.py); with arguments, the bake itself:
+#   ./bake-halo.sh <Halo disc image or maps folder> <output folder> [options]
+#
+# It finds a Python 3.9 to 3.14 (the bake's environment's own once made, a
+# Python it downloaded before, then the newest python3.14 ... python3.9,
+# python3 or python), and hands over to launcher.py, which sets up the bake's
+# own environment on the first run. With none, it offers to download a
+# portable Python from its official release (python-build-standalone),
+# checked against the SHA-256 pinned below, into .python in this folder.
+#
+# HALO_PSP_BAKE_YES=1 answers its question yes (the tests).
+# HALO_PSP_BAKE_NO_SYSTEM_PYTHON=1 looks past the system's Python, as on a
+# machine without one (the tests; or when the system's is broken).
+HERE=$(cd "$(dirname "$0")" && pwd)
+OS=$(uname -s)
+ARCH=$(uname -m)
+
+# The portable Python: python-build-standalone's release, pinned. Its
+# SHA256SUMS lists these; a new pin takes the new release's lines.
+PBS_RELEASE=20261003
+PBS_VERSION=3.12.15
+case "$OS-$ARCH" in
+  Linux-x86_64)  PBS_TRIPLE=x86_64-unknown-linux-gnu PBS_SHA=731af898886c5f821890dc901eca3c651cca8e51fa7308c159d12a1194aeac91 ;;
+  Darwin-arm64)  PBS_TRIPLE=aarch64-apple-darwin     PBS_SHA=ad8d0c637c0a36b967b310e2c07254f4d2ca8cabaa7699e55ed6290aceb481a2 ;;
+  Darwin-x86_64) PBS_TRIPLE=x86_64-apple-darwin      PBS_SHA=562c30864ece2cb1d3e0ad66a1acd498611a47e5a10ce81b99158bef1ccbd355 ;;
+  *)             PBS_TRIPLE="" PBS_SHA="" ;;
+esac
+PBS_FILE="cpython-$PBS_VERSION+$PBS_RELEASE-$PBS_TRIPLE-install_only_stripped.tar.gz"
+PBS_PAGE="https://github.com/astral-sh/python-build-standalone/releases/tag/$PBS_RELEASE"
+PBS_URL="https://github.com/astral-sh/python-build-standalone/releases/download/$PBS_RELEASE/$(echo "$PBS_FILE" | sed 's/+/%2B/')"
+
+# Double-clicked: no arguments. The window must stay open to the end, and a
+# file manager may start this with no terminal at all.
+GUIDED=""
+[ $# -eq 0 ] && GUIDED=1
+finish() {
+  if [ -n "$GUIDED" ] && [ -t 0 ] && [ "${HALO_PSP_BAKE_YES:-}" != 1 ]; then
+    printf '\nPress Enter to close this window.'
+    read -r _ || true
+  fi
+  exit "$1"
+}
+
+if [ -n "$GUIDED" ] && [ ! -t 0 ] && [ ! -t 1 ] && [ -z "${HALO_PSP_BAKE_IN_TERMINAL:-}" ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+  # started from a file manager without a terminal: open one to run in
+  export HALO_PSP_BAKE_IN_TERMINAL=1
+  for t in x-terminal-emulator gnome-terminal ptyxis kgx konsole xfce4-terminal mate-terminal lxterminal \
+           tilix alacritty kitty foot wezterm xterm; do
+    command -v "$t" >/dev/null 2>&1 || continue
+    case $t in
+      gnome-terminal|ptyxis|kgx) "$t" -- "$HERE/$(basename "$0")" && exit 0 ;;
+      xfce4-terminal|mate-terminal) "$t" -x "$HERE/$(basename "$0")" && exit 0 ;;
+      kitty|foot) "$t" "$HERE/$(basename "$0")" && exit 0 ;;
+      wezterm) "$t" start -- "$HERE/$(basename "$0")" && exit 0 ;;
+      *) "$t" -e "$HERE/$(basename "$0")" && exit 0 ;;
+    esac
+  done
+  # no terminal found: bake without one; everything is in bake-log.txt
+fi
+
+if [ "$OS" = Darwin ] && xattr -p com.apple.quarantine "$HERE/invader/bin/invader-info" >/dev/null 2>&1; then
+  # macOS blocks programs downloaded from the internet that no Apple
+  # developer signed. The player chose to run this, so the bundle's own
+  # programs are let run too (nothing outside this folder changes)
+  echo "macOS: letting this folder's own programs run (they came in the download, unsigned)"
+  xattr -dr com.apple.quarantine "$HERE" 2>/dev/null || true
+fi
+
+usable() { "$1" -c 'import sys; sys.exit(0 if (3, 9) <= sys.version_info[:2] <= (3, 14) else 1)' >/dev/null 2>&1; }
+# the first usable Python runs launcher.py (the guided bake waits for Enter itself)
+COMPARE=""
+for argument in "$@"; do [ "$argument" = --compare-old ] && COMPARE=1; done
+for local_python in "$HERE/.venv/bin/python" "$HERE/.python/bin/python3"; do
+  if [ -x "$local_python" ] && usable "$local_python"; then
+    "$local_python" "$HERE/launcher.py" "$@"
+    exit $?
+  fi
+done
+if [ "${HALO_PSP_BAKE_NO_SYSTEM_PYTHON:-}" != 1 ]; then
+  for candidate in python3.14 python3.13 python3.12 python3.11 python3.10 python3.9 python3 python; do
+    # --compare-old's Triangle has no package for 3.14
+    [ -n "$COMPARE" ] && [ "$candidate" = python3.14 ] && continue
+    path=$(command -v "$candidate" 2>/dev/null) || continue
+    # macOS's /usr/bin/python3 without the Command Line Tools only asks to
+    # install them
+    [ "$OS" = Darwin ] && [ "$path" = /usr/bin/python3 ] && ! xcode-select -p >/dev/null 2>&1 && continue
+    if usable "$path"; then
+      "$path" "$HERE/launcher.py" "$@"
+      exit $?
+    fi
+  done
+fi
+
+say() { printf '%s\n' "$*"; }
+install_hint() {
+  say ""
+  if [ "$OS" = Darwin ]; then
+    say "Or install Python 3.12 from https://www.python.org/downloads/macos/ and start this again."
+  else
+    say "Or install your distribution's python3 (with python3-venv on Debian and Ubuntu) and start this again."
+  fi
+}
+say "The bake needs Python 3.9 to 3.14, and this computer has none it can use."
+if [ -z "$PBS_TRIPLE" ]; then
+  say "There is no portable Python for this system ($OS $ARCH) to download."
+  install_hint
+  finish 1
+fi
+say ""
+say "It can download a portable Python $PBS_VERSION for the bake alone (about 25 to 35 MB),"
+say "from its official release, python-build-standalone:"
+say "    $PBS_PAGE"
+say "It goes into this folder (.python), is checked against the SHA-256 the bake carries,"
+say "and nothing else on this computer changes."
+if [ "${HALO_PSP_BAKE_YES:-}" = 1 ]; then
+  answer=y
+elif [ -t 0 ]; then
+  printf 'Download it? [Y/n] '
+  read -r answer || answer=n
+  [ -z "$answer" ] && answer=y
+else
+  answer=n
+fi
+case $answer in
+  y|Y|yes|Yes|YES) ;;
+  *) say "Not downloaded."; install_hint; finish 1 ;;
+esac
+
+part="$HERE/.python-download"
+rm -rf "$part" && mkdir -p "$part" || finish 1
+say "Downloading $PBS_FILE ..."
+# a progress bar on a terminal; a log gets only errors
+if [ -t 2 ]; then CURL_SHOW=--progress-bar WGET_SHOW=--show-progress; else CURL_SHOW=-sS WGET_SHOW=""; fi
+if command -v curl >/dev/null 2>&1; then
+  curl -fL --retry 3 "$CURL_SHOW" -o "$part/python.tar.gz" "$PBS_URL"
+elif command -v wget >/dev/null 2>&1; then
+  wget -q $WGET_SHOW -O "$part/python.tar.gz" "$PBS_URL"
+else
+  say "Neither curl nor wget is here to download it with."
+  install_hint
+  rm -rf "$part"
+  finish 1
+fi || { say "The download failed (is the internet reachable?)."; rm -rf "$part"; finish 1; }
+if command -v sha256sum >/dev/null 2>&1; then
+  got=$(sha256sum "$part/python.tar.gz" | cut -d' ' -f1)
+else
+  got=$(shasum -a 256 "$part/python.tar.gz" | cut -d' ' -f1)
+fi
+if [ "$got" != "$PBS_SHA" ]; then
+  say "The download isn't the file the bake expects (its SHA-256 is $got, not $PBS_SHA), so it wasn't used."
+  rm -rf "$part"
+  finish 1
+fi
+mkdir "$part/unpacked" && tar -xzf "$part/python.tar.gz" -C "$part/unpacked" || { say "Unpacking it failed."; rm -rf "$part"; finish 1; }
+rm -rf "$HERE/.python" && mv "$part/unpacked/python" "$HERE/.python" && rm -rf "$part" || finish 1
+if ! usable "$HERE/.python/bin/python3"; then
+  say "The downloaded Python doesn't start on this system."
+  install_hint
+  finish 1
+fi
+say "Python $PBS_VERSION is ready, in $HERE/.python"
+say ""
+"$HERE/.python/bin/python3" "$HERE/launcher.py" "$@"
+exit $?

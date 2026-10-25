@@ -1,0 +1,20 @@
+diff --git a/dependencies.cmake b/dependencies.cmake
+index 61a2d47d..1b00ab26 100644
+--- a/dependencies.cmake
++++ b/dependencies.cmake
+@@ -21,10 +21,11 @@ if(INVADER_USING_WIN32_STATIC_QT)
+     add_compile_definitions(INVADER_WIN32_STATIC_QT)
+ endif()
+ 
+-find_package(Qt6 COMPONENTS Core Widgets REQUIRED)
+-
+-# SDL2
+-find_package(SDL2 REQUIRED)
++# Qt6 and SDL2: only the tag editor (invader-edit-qt) uses them
++if(NOT DEFINED INVADER_EDIT_QT OR INVADER_EDIT_QT)
++    find_package(Qt6 COMPONENTS Core Widgets REQUIRED)
++    find_package(SDL2 REQUIRED)
++endif()
+ 
+ # Load Rat In a Tube
+ option(INVADER_USE_SYSTEM_CORROSION "Use system installed corrosion package" ON)

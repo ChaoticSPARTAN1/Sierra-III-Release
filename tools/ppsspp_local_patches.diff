@@ -1,0 +1,752 @@
+diff --git a/Common/MemArenaPosix.cpp b/Common/MemArenaPosix.cpp
+index 38598a2..cebed57 100644
+--- a/Common/MemArenaPosix.cpp
++++ b/Common/MemArenaPosix.cpp
+@@ -58,7 +58,19 @@ bool MemArena::GrabMemSpace(size_t size) {
+ 	// Try a few times in case multiple instances are started near each other.
+ 	char ram_temp_filename[128]{};
+ 	bool is_shm = false;
+-	for (int i = 0; i < 256; ++i) {
++	fd = -1;
++#if defined(__linux__)
++	// Local patch (Halo port): an anonymous memory file first. /dev/shm is a mount with a size of
++	// its own (64 MB in a Podman or Docker container), and the file below is sparse, so a second
++	// instance there runs it out and every instance takes SIGBUS as it clears its RAM. A memfd
++	// counts only against the process's memory limit, and has no name to clash.
++	fd = memfd_create("ppsspp_ram", MFD_CLOEXEC);
++	if (fd >= 0) {
++		INFO_LOG(Log::MemMap, "Got memfd for the ram");
++		is_shm = true;
++	}
++#endif
++	for (int i = 0; fd < 0 && i < 256; ++i) {
+ 		snprintf(ram_temp_filename, sizeof(ram_temp_filename), "/ppsspp_%d.ram", i);
+ 		// This opens atomically, so will fail if another process is starting.
+ 		fd = shm_open(ram_temp_filename, O_RDWR | O_CREAT | O_EXCL, mode);
+diff --git a/Core/CoreTiming.cpp b/Core/CoreTiming.cpp
+index ca20954..98275c9 100644
+--- a/Core/CoreTiming.cpp
++++ b/Core/CoreTiming.cpp
+@@ -23,8 +23,10 @@
+ #include <mutex>
+ #include <set>
+ #include <vector>
++#include <string>
+ 
+ #include "Common/Profiler/Profiler.h"
++#include "Core/MemMap.h"
+ 
+ #include "Common/Serialize/Serializer.h"
+ #include "Common/Serialize/SerializeList.h"
+@@ -422,8 +424,67 @@ void ForceCheck(MIPSState *mips) {
+ #endif
+ }
+ 
++// local patch (Halo PSP port, b106): PSP_PCSAMPLE=<file> samples the PC (and
++// $ra) of the running thread every PSP_PCSAMPLE_CYCLES emulated cycles
++// (default 33300: 100 us at 333 MHz) and writes "thread pc ra count" lines to
++// the file every 4096 samples. Emulated cycles, so it finds where the game's
++// instructions go (no cache model): tools/pcprofile.py maps it to functions
++#include <map>
++#include <tuple>
++static int pcSampleEvent = -1;
++static s64 pcSampleCycles = 33300;
++static std::map<std::tuple<std::string, u32, u32, std::string>, u64> pcSamples;
++// PSP_PCSAMPLE_STEP=<hex address> (b106): a pointer variable in the game
++// (its psp_step's last_step: the name of the step running), read at each
++// sample and written as a fifth field, so a step's samples (every thread's)
++// can be told apart: tools/pcprofile.py --step
++static u32 pcSampleStepAddress = 0;
++static u64 pcSampleCount = 0;
++static void PcSampleDump() {
++	const char *path = getenv("PSP_PCSAMPLE");
++	if (!path) return;
++	FILE *f = fopen(path, "w");
++	if (!f) return;
++	for (auto &e : pcSamples)
++		if (pcSampleStepAddress)
++			fprintf(f, "%s %08x %08x %llu %s\n", std::get<0>(e.first).c_str(), std::get<1>(e.first), std::get<2>(e.first), (unsigned long long)e.second, std::get<3>(e.first).c_str());
++		else
++			fprintf(f, "%s %08x %08x %llu\n", std::get<0>(e.first).c_str(), std::get<1>(e.first), std::get<2>(e.first), (unsigned long long)e.second);
++	fclose(f);
++}
++static void PcSampleCallback(u64 userdata, int cyclesLate) {
++	const char *name = __KernelGetThreadName(__KernelGetCurThread());
++	std::string thread = name ? name : "?";
++	for (auto &c : thread) if (c == ' ') c = '_';
++	std::string step = "-";
++	if (pcSampleStepAddress && Memory::IsValid4AlignedAddress(pcSampleStepAddress)) {
++		u32 pointer = Memory::ReadUnchecked_U32(pcSampleStepAddress);
++		if (pointer && Memory::IsValidAddress(pointer)) {
++			const char *text = Memory::GetCharPointerUnchecked(pointer);
++			size_t length = 0;
++			while (length < 64 && Memory::IsValidAddress(pointer + (u32)length) && text[length])
++				length++;
++			step.assign(text, length);
++			for (auto &c : step) if (c == ' ' || c == '\n' || c == '\t') c = '_';
++			if (step.empty()) step = "-";
++		}
++	}
++	pcSamples[std::make_tuple(thread, currentMIPS->pc, currentMIPS->r[31], step)]++;
++	if (++pcSampleCount % 4096 == 0)
++		PcSampleDump();
++	ScheduleEvent(pcSampleCycles - cyclesLate, pcSampleEvent, 0);
++}
++
+ void Advance(MIPSState *mips) {
+ 	PROFILE_THIS_SCOPE("advance");
++	if (pcSampleEvent < 0 && getenv("PSP_PCSAMPLE")) {
++		const char *c = getenv("PSP_PCSAMPLE_CYCLES");
++		if (c && atoll(c) > 1000) pcSampleCycles = atoll(c);
++		const char *s = getenv("PSP_PCSAMPLE_STEP");
++		if (s) pcSampleStepAddress = (u32)strtoul(s, nullptr, 16);
++		pcSampleEvent = RegisterEvent("PcSample", PcSampleCallback);
++		ScheduleEvent(pcSampleCycles, pcSampleEvent, 0);
++	}
+ 	int cyclesExecuted = slicelength - mips->downcount;
+ 	globalTimer += cyclesExecuted;
+ 	mips->downcount = slicelength;
+diff --git a/Core/HLE/sceIo.cpp b/Core/HLE/sceIo.cpp
+index 8d4b05a..80db818 100644
+--- a/Core/HLE/sceIo.cpp
++++ b/Core/HLE/sceIo.cpp
+@@ -360,8 +360,18 @@ static FileNode *__IoGetFd(int fd, u32 &error) {
+ }
+ 
+ static int __IoAllocFd(FileNode *f) {
++	// local patch (Halo PSP port, b105): PSP_MAXFD=<n> hands out descriptors
++	// below n only. a PSP-1000 (6.61, ARK-4) refused the 13th (b104 run 1:
++	// descriptors 3-12 in use), where the emulator allows 64
++	static int limit = -1;
++	if (limit < 0) {
++		const char *p = getenv("PSP_MAXFD");
++		limit = p ? atoi(p) : PSP_COUNT_FDS;
++		if (limit <= PSP_MIN_FD || limit > PSP_COUNT_FDS)
++			limit = PSP_COUNT_FDS;
++	}
+ 	// The PSP takes the lowest available id after stderr/etc.
+-	for (int possible = PSP_MIN_FD; possible < PSP_COUNT_FDS; ++possible) {
++	for (int possible = PSP_MIN_FD; possible < limit; ++possible) {
+ 		if (fds[possible] == 0) {
+ 			fds[possible] = f->GetUID();
+ 			return possible;
+@@ -1622,6 +1632,14 @@ static FileNode *__IoOpen(int &error, const char *filename, int flags, int mode)
+ 	return f;
+ }
+ 
++
++// local patch: PSP_IOTRACE=<file> logs every open/close/dopen/dclose (handle balance)
++static FILE *ioTraceFile() {
++	static FILE *f = nullptr; static bool tried = false;
++	if (!tried) { tried = true; const char *p = getenv("PSP_IOTRACE"); if (p) f = fopen(p, "w"); }
++	return f;
++}
++#define IOTRACE(...) do { FILE *tf_ = ioTraceFile(); if (tf_) { fprintf(tf_, __VA_ARGS__); fflush(tf_); } } while (0)
+ static u32 sceIoOpen(const char *filename, int flags, int mode) {
+ 	hleEatCycles(18000);
+ 
+@@ -1657,6 +1675,7 @@ static u32 sceIoOpen(const char *filename, int flags, int mode) {
+ 	}
+ 
+ 	int id = __IoAllocFd(f);
++	IOTRACE("open %d %s\n", id, filename);
+ 	if (id < 0) {
+ 		kernelObjects.Destroy<FileNode>(f->GetUID());
+ 		return hleDelayResult(hleLogError(Log::sceIo, id, "out of fds"), "file opened", 1000);
+@@ -1672,6 +1691,7 @@ static u32 sceIoOpen(const char *filename, int flags, int mode) {
+ }
+ 
+ static u32 sceIoClose(int id) {
++	IOTRACE("close %d\n", id);
+ 	u32 error;
+ 	__IoFreeFd(id, error);
+ 	// Timing is not accurate, aiming low for now.
+@@ -2261,6 +2281,7 @@ static int sceIoCloseAsync(int id) {
+ 	}
+ 
+ 	f->closePending = true;
++	IOTRACE("close %d async\n", id);
+ 
+ 	auto &params = asyncParams[id];
+ 	params.op = IoAsyncOp::CLOSE;
+@@ -2311,6 +2332,7 @@ static u32 sceIoOpenAsync(const char *filename, int flags, int mode) {
+ 
+ 	// We need an fd even for errors, since it's async.
+ 	int fd = __IoAllocFd(f);
++	IOTRACE("open %d %s async\n", fd, filename);
+ 	if (fd < 0) {
+ 		kernelObjects.Destroy<FileNode>(f->GetUID());
+ 		return hleDelayResult(hleLogError(Log::sceIo, fd, "out of fds"), "file opened", 1000);
+@@ -2545,6 +2567,7 @@ static u32 sceIoDopen(const char *path) {
+ 	dir->listing = listing;
+ 	dir->index = 0;
+ 	dir->name = std::string(path);
++	IOTRACE("dopen %d %s\n", id, path);
+ 
+ 	double listTime = time_now_d() - startTime;
+ 
+@@ -2669,6 +2692,7 @@ static u32 sceIoDread(int id, u32 dirent_addr) {
+ }
+ 
+ static u32 sceIoDclose(int id) {
++	IOTRACE("dclose %d\n", id);
+ 	return hleLogDebug(Log::sceIo, kernelObjects.Destroy<DirListing>(id));
+ }
+ 
+diff --git a/Core/MIPS/Interpreter.cpp b/Core/MIPS/Interpreter.cpp
+index 723b566..9baa426 100644
+--- a/Core/MIPS/Interpreter.cpp
++++ b/Core/MIPS/Interpreter.cpp
+@@ -1,3 +1,5 @@
++#include <cstdlib>
++#include <cstdio>
+ // Copyright (c) 2012- PPSSPP Project.
+ 
+ // This program is free software: you can redistribute it and/or modify
+@@ -170,6 +172,44 @@ void WriteMMIO_U32(MIPSState *mips, u32 addr, u32 value) {
+ 	WARN_LOG(Log::CPU, "Unhandled MMIO Write32 at %08x = %08x", addr, value);
+ }
+ 
++
++// local patch (Halo PSP port): report user-code accesses real hardware faults
++// on but PPSSPP allows - kernel RAM (0x08000000-0x087fffff) and the kernel
++// segments (0x80000000 and up)
++#include <set>
++static u32 watch_start = 0, watch_end = 0;
++static void StrictUserCheck(u32 pc, u32 addr, const char *what) {
++	if (!watch_start && getenv("PSP_WATCH")) {
++		sscanf(getenv("PSP_WATCH"), "%x:%x", &watch_start, &watch_end);
++		watch_end += watch_start;
++	}
++	if (watch_start && what[0] == 's' && (addr & 0x3FFFFFFF) >= watch_start && (addr & 0x3FFFFFFF) < watch_end) {
++		static std::set<u32> wseen;
++		if (wseen.insert(pc).second)
++			fprintf(stderr, "WATCH: store to %08x from pc %08x\n", addr, pc);
++	}
++	if (pc < 0x08804000 || pc >= 0x08C00000)
++		return;
++	u32 a = addr & 0x3FFFFFFF;
++	bool bad = (addr & 0x80000000) != 0 || (a >= 0x08000000 && a < 0x08400000) /* 0x08400000-0x08800000: the volatile 4 MB, ours since sceKernelVolatileMemLock */ || a < 0x00010000 ||
++		(a >= 0x0A000000 && a < 0x10000000) /* a PSP-1000 has 32 MB: no RAM from 0x0a000000 */;
++	if (!bad)
++		return;
++	static std::set<u32> seen;
++	if (seen.insert(pc).second)
++		fprintf(stderr, "STRICT: %s of %08x from pc %08x\n", what, addr, pc);
++}
++
++
++// local patch (Halo PSP port): FPU operations that trap on real hardware,
++// where threads start with the overflow, divide-by-zero and invalid traps
++// enabled (fcr31 0x00000e00), but which PPSSPP lets through
++static void StrictFpu(u32 pc, u32 fcr31, const char *what) {
++	static std::set<u32> seen;
++	if (seen.insert(pc).second)
++		fprintf(stderr, "STRICT FPU: %s at pc %08x (fcr31 %08x)\n", what, pc, fcr31);
++}
++
+ namespace MIPSInt {
+ 	void Int_Cache(MIPSState *mips, MIPSOpcode op) {
+ 		int imm = SignExtend16ToS32(op);
+@@ -496,6 +536,17 @@ namespace MIPSInt {
+ 		int rs = _RS;
+ 		const u32 addr = R(rs) + imm;
+ 
++		StrictUserCheck(PC, addr, (op >> 29) & 1 ? "store" : "load");
++		{
++			/* local patch: unaligned lh/lhu/sh and lw/sw (address error on the PSP) */
++			const u32 opc = op >> 26;
++			const u32 need = (opc == 0x21 || opc == 0x25 || opc == 0x29) ? 2 : (opc == 0x23 || opc == 0x2b) ? 4 : 1;
++			if (need > 1 && (addr & (need - 1)) && PC >= 0x08804000 && PC < 0x08C00000) {
++				static std::set<u32> useen;
++				if (useen.insert(PC).second)
++					fprintf(stderr, "STRICT: unaligned %s of %u bytes at %08x from pc %08x\n", (op >> 29) & 1 ? "store" : "load", need, addr, PC);
++			}
++		}
+ 		if (((op >> 29) & 1) == 0 && rt == 0) {
+ 			// Don't load anything into $zr
+ 			PC += 4;
+@@ -679,6 +730,12 @@ namespace MIPSInt {
+ 		int rs = _RS;
+ 		u32 addr = R(rs) + offset;
+ 
++		StrictUserCheck(PC, addr, "fpu load/store");
++		if ((addr & 3) && PC >= 0x08804000 && PC < 0x08C00000) {
++			static std::set<u32> fseen;
++			if (fseen.insert(PC).second)
++				fprintf(stderr, "STRICT: unaligned fpu load/store at %08x from pc %08x\n", addr, PC);
++		}
+ 		switch (op >> 26) {
+ 		case 49:
+ 			if (!Memory::IsValid4AlignedAddress(addr)) {
+@@ -1117,6 +1174,18 @@ namespace MIPSInt {
+ 	void Int_FPU2op(MIPSState *mips, MIPSOpcode op) {
+ 		int fs = _FS;
+ 		int fd = _FD;
++		{
++			const float a = F(fs);
++			const u32 o = op & 0x3f;
++			if (mips->fcr31 & 0x800) {
++				if (o == 4 && a < 0.0f)
++					StrictFpu(PC, mips->fcr31, "invalid operation (sqrt of a negative)");
++				else if ((o >= 12 && o <= 15) || o == 36) {
++					if (my_isnan(a) || a >= 2147483648.0f || a < -2147483648.0f)
++						StrictFpu(PC, mips->fcr31, "invalid operation (float to int out of range)");
++				}
++			}
++		}
+ 
+ 		switch (op & 0x3f)
+ 		{
+@@ -1166,6 +1235,8 @@ namespace MIPSInt {
+ 		int fs = _FS;
+ 		int ft = _FT;
+ 		bool cond;
++		if ((mips->fcr31 & 0x800) && (op & 0x8) && (my_isnan(F(fs)) || my_isnan(F(ft))))
++			StrictFpu(PC, mips->fcr31, "invalid operation (signalling compare with a NaN)");
+ 		switch (op & 0xf)
+ 		{
+ 		case 0: //f
+@@ -1221,6 +1292,8 @@ namespace MIPSInt {
+ 		int ft = _FT;
+ 		int fs = _FS;
+ 		int fd = _FD;
++		const float strict_a = F(fs), strict_b = F(ft);
++		const u32 strict_op = op & 0x3f, strict_pc = PC;
+ 
+ 		switch (op & 0x3f)
+ 		{
+@@ -1267,6 +1340,17 @@ namespace MIPSInt {
+ 			_dbg_assert_msg_(false,"Trying to interpret FPU3Op instruction that can't be interpreted");
+ 			break;
+ 		}
++		if (strict_op <= 3) {
++			const float r = F(fd);
++			if ((mips->fcr31 & 0x400) && strict_op == 3 && strict_b == 0.0f && strict_a != 0.0f && !my_isnanorinf(strict_a))
++				StrictFpu(strict_pc, mips->fcr31, "divide by zero");
++			else if ((mips->fcr31 & 0x800) && my_isnan(r) && !my_isnan(strict_a) && !my_isnan(strict_b))
++				StrictFpu(strict_pc, mips->fcr31, "invalid operation (NaN from numbers)");
++			else if ((mips->fcr31 & 0x200) && my_isinf(r) && !my_isnanorinf(strict_a) && !my_isnanorinf(strict_b) && strict_op != 3)
++				StrictFpu(strict_pc, mips->fcr31, "overflow");
++			else if ((mips->fcr31 & 0x200) && my_isinf(r) && strict_op == 3 && strict_b != 0.0f && !my_isnanorinf(strict_a) && !my_isnanorinf(strict_b))
++				StrictFpu(strict_pc, mips->fcr31, "overflow (division)");
++		}
+ 		PC += 4;
+ 	}
+ 
+diff --git a/Core/MIPS/JitCommon/JitBlockCache.cpp b/Core/MIPS/JitCommon/JitBlockCache.cpp
+index ac010e6..31994e4 100644
+--- a/Core/MIPS/JitCommon/JitBlockCache.cpp
++++ b/Core/MIPS/JitCommon/JitBlockCache.cpp
+@@ -17,6 +17,8 @@
+ 
+ #include "ppsspp_config.h"
+ #include <cstddef>
++#include <cstdio>
++#include <cstdlib>
+ #include <algorithm>
+ 
+ #include "ext/xxhash.h"
+@@ -169,8 +171,44 @@ static void ExpandRange(std::pair<u32, u32> &range, u32 newStart, u32 newEnd) {
+ 	range.second = std::max(range.second, newEnd);
+ }
+ 
++// local patch (Halo PSP port, b107): PSP_COVERAGE=<file> records every
++// compiled block's first address and length (in instructions) once, and
++// rewrites the file as "start count" lines every 1024 new blocks, so which
++// of the game's code ever ran can be told (tools/coverage.py)
++#include <set>
++#include <utility>
++static std::set<std::pair<u32, u32>> coverageBlocks;
++static size_t coverageWritten = 0;
++static void CoverageWrite() {
++	const char *path = getenv("PSP_COVERAGE");
++	if (!path)
++		return;
++	coverageWritten = coverageBlocks.size();
++	FILE *f = fopen(path, "w");
++	if (!f)
++		return;
++	for (auto &e : coverageBlocks)
++		fprintf(f, "%08x %u\n", e.first, e.second);
++	fclose(f);
++}
++static void CoverageRecord(u32 start, u32 count) {
++	static const char *path = getenv("PSP_COVERAGE");
++	static bool registered = false;
++	if (!path)
++		return;
++	if (!registered) {
++		registered = true;
++		atexit(CoverageWrite);
++	}
++	if (!coverageBlocks.insert(std::make_pair(start, count)).second)
++		return;
++	if (coverageBlocks.size() - coverageWritten >= 1024)
++		CoverageWrite();
++}
++
+ void JitBlockCache::FinalizeBlock(int block_num, bool block_link) {
+ 	JitBlock &b = blocks_[block_num];
++	CoverageRecord(b.originalAddress, b.originalSize);
+ 
+ 	b.originalFirstOpcode = Memory::Read_Opcode_JIT(b.originalAddress);
+ 	MIPSOpcode opcode = GetEmuHackOpForBlock(block_num);
+diff --git a/Core/MIPS/MIPSTables.cpp b/Core/MIPS/MIPSTables.cpp
+index 6ace0f2..52725c2 100644
+--- a/Core/MIPS/MIPSTables.cpp
++++ b/Core/MIPS/MIPSTables.cpp
+@@ -1089,6 +1089,265 @@ void MIPSDisAsm(MIPSOpcode op, u32 pc, char *out, size_t outSize, bool tabsToSpa
+ // This is the fast runloop for the interpreter.
+ // When making changes, always make sure it's in sync with the fallback loop, RunUntilDowncountZeroWithChecks, which is
+ // far less efficient but supports breakpoints of all kinds etc.
++
++// local patch (Halo PSP port, build 102): an Allegrex I-cache model on the
++// interpreter's fetches (16 KB, 2-way, 64-byte lines, LRU), PSP_ICACHE=1.
++// With PSP_ICACHE_MAP=<file> of "old_start old_end new_start" lines (hex),
++// a second cache sees the same fetches at a remapped address: the miss count
++// of a reordered program, measured on one run. At exit, counts go to
++// PSP_ICACHE_OUT (default /tmp/claude-0/icache.bin): per 64-byte line of the
++// game's text (0x08804000-0x08C00000) its fetches and its misses.
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++#include <algorithm>
++#include <string>
++namespace {
++struct ICacheModel {
++	u32 tag[128][2];
++	u8 lru[128];
++	u64 misses = 0;
++	ICacheModel() { for (int s = 0; s < 128; s++) { tag[s][0] = tag[s][1] = 0xFFFFFFFF; lru[s] = 0; } }
++	inline bool access(u32 addr) {
++		u32 line = addr >> 6, set = line & 127;
++		if (tag[set][0] == line) { lru[set] = 1; return true; }
++		if (tag[set][1] == line) { lru[set] = 0; return true; }
++		int victim = lru[set];  // lru[set] names the way to replace next
++		tag[set][victim] = line;
++		lru[set] = victim ^ 1;
++		misses++;
++		return false;
++	}
++};
++struct ICacheMap {
++	std::vector<u32> old_start, old_end, new_start;
++	ICacheModel cache;
++	inline u32 mapped(u32 pc) const {
++		size_t i = std::upper_bound(old_start.begin(), old_start.end(), pc) - old_start.begin();
++		if (i == 0) return pc;
++		i--;
++		if (pc < old_end[i]) return new_start[i] + (pc - old_start[i]);
++		return pc;
++	}
++};
++struct ICacheState {
++	bool on = false, init = false;
++	ICacheModel a;
++	std::vector<ICacheMap> maps;
++	u64 fetches = 0;
++	std::vector<u32> line_fetches, line_misses, line_misses_b;
++	static const u32 lo = 0x08804000, hi = 0x08C00000;
++	void setup() {
++		init = true;
++		on = getenv("PSP_ICACHE") != nullptr;
++		if (!on) return;
++		line_fetches.assign((hi - lo) >> 6, 0);
++		line_misses.assign((hi - lo) >> 6, 0);
++		line_misses_b.assign((hi - lo) >> 6, 0);
++		// PSP_ICACHE_MAP: one or more map files, comma-separated
++		if (const char *m = getenv("PSP_ICACHE_MAP")) {
++			std::string all(m);
++			size_t at = 0;
++			while (at <= all.size()) {
++				size_t comma = all.find(',', at);
++				std::string name = all.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
++				if (!name.empty()) {
++					FILE *f = fopen(name.c_str(), "r");
++					ICacheMap map;
++					unsigned a1, a2, a3;
++					while (f && fscanf(f, "%x %x %x", &a1, &a2, &a3) == 3) {
++						map.old_start.push_back(a1); map.old_end.push_back(a2); map.new_start.push_back(a3);
++					}
++					if (f) fclose(f);
++					if (!map.old_start.empty()) maps.push_back(map);
++				}
++				if (comma == std::string::npos) break;
++				at = comma + 1;
++			}
++		}
++	}
++	void dump() {
++		if (!on) return;
++		const char *out = getenv("PSP_ICACHE_OUT");
++		FILE *f = fopen(out ? out : "/tmp/claude-0/icache.bin", "wb");
++		if (!f) return;
++		u64 header[4] = { fetches, a.misses, maps.empty() ? 0ULL : maps[0].cache.misses, (u64)maps.size() };
++		fwrite(header, sizeof(header), 1, f);
++		fwrite(line_fetches.data(), 4, line_fetches.size(), f);
++		fwrite(line_misses.data(), 4, line_misses.size(), f);
++		fwrite(line_misses_b.data(), 4, line_misses_b.size(), f);
++		fclose(f);
++		fprintf(stderr, "ICACHE: %llu fetches, %llu misses (%.3f%%)", (unsigned long long)fetches,
++			(unsigned long long)a.misses, fetches ? 100.0 * a.misses / fetches : 0.0);
++		for (size_t i = 0; i < maps.size(); i++)
++			fprintf(stderr, "; layout %d: %llu misses (%+.1f%%)", (int)i + 1, (unsigned long long)maps[i].cache.misses,
++				a.misses ? 100.0 * ((double)maps[i].cache.misses - (double)a.misses) / (double)a.misses : 0.0);
++		fprintf(stderr, "\n");
++	}
++	inline void fetch(u32 pc) {
++		u32 p = pc & 0x1FFFFFFF;
++		fetches++;
++		bool hit = a.access(p);
++		bool in_text = p >= lo && p < hi;
++		if (in_text) {
++			line_fetches[(p - lo) >> 6]++;
++			if (!hit) line_misses[(p - lo) >> 6]++;
++		}
++		for (size_t i = 0; i < maps.size(); i++) {
++			bool hit_b = maps[i].cache.access(in_text ? maps[i].mapped(p) : p);
++			if (i == 0 && !hit_b && in_text) line_misses_b[(p - lo) >> 6]++;
++		}
++	}
++};
++ICacheState g_icache;
++struct ICacheDumper { ~ICacheDumper() { g_icache.dump(); } } g_icache_dumper;
++}
++void PSPICacheDump() { g_icache.dump(); g_icache.on = false; }
++static inline void ICacheFetch(u32 pc) {
++	if (!g_icache.init) g_icache.setup();
++	if (g_icache.on) g_icache.fetch(pc);
++}
++// local patch (Halo PSP port, 2026-10-09): an Allegrex D-cache model on the
++// interpreter's loads and stores (16 KB, 2-way, 64-byte lines, LRU, write
++// allocate), PSP_DCACHE=1. Decodes each load/store before it executes (the
++// base register is current then), so memory touched inside HLE calls and
++// function replacements is not seen. Uncached addresses (bit 30, the
++// 0x4xxxxxxx mirrors) and the scratchpad bypass the cache and are counted
++// apart. PSP_DCACHE_PHASE=<hex address> of the game's phase word (0 other,
++// 1 tick, 2 drawing, 3 frame end) splits every count by phase. At exit:
++// PSP_DCACHE_OUT (default /tmp/claude-0/dcache.bin): a header, then per
++// 64-byte line of 0x08000000-0x0A000000, per phase, accesses and misses.
++namespace {
++struct DCacheState {
++	bool on = false, init = false;
++	u32 tag[128][2];
++	u8 lru[128];
++	u32 phase_addr = 0;
++	static const u32 lo = 0x08000000, hi = 0x0A000000;
++	static const int PHASES = 4;
++	std::vector<u32> accesses, misses;  // [phase][line]
++	ICacheModel icache;                  // its own I-cache model, for misses by phase
++	std::vector<u32> ifetches, imisses;  // [phase][line]
++	std::vector<u32> dmiss_pc;           // [phase][line of the instruction whose access missed]
++	u64 ifetched[PHASES] = {}, imissed[PHASES] = {};
++	// ticks: the phase word's entries into the tick phase (1), which the game
++	// sets around each game_tick; printed at exit, so a run's counts can be
++	// read per tick exactly (a run from a savestate starts mid-window)
++	u64 ticks = 0;
++	int last_phase = 0;
++	u64 total[PHASES] = {}, missed[PHASES] = {}, uncached[PHASES] = {}, scratch[PHASES] = {}, stores[PHASES] = {};
++	void setup() {
++		init = true;
++		on = getenv("PSP_DCACHE") != nullptr;
++		if (!on) return;
++		for (int s = 0; s < 128; s++) { tag[s][0] = tag[s][1] = 0xFFFFFFFF; lru[s] = 0; }
++		if (const char *a = getenv("PSP_DCACHE_PHASE")) phase_addr = (u32)strtoul(a, nullptr, 16);
++		accesses.assign((size_t)PHASES * ((hi - lo) >> 6), 0);
++		misses.assign((size_t)PHASES * ((hi - lo) >> 6), 0);
++		ifetches.assign((size_t)PHASES * ((hi - lo) >> 6), 0);
++		imisses.assign((size_t)PHASES * ((hi - lo) >> 6), 0);
++		dmiss_pc.assign((size_t)PHASES * ((hi - lo) >> 6), 0);
++	}
++	void dump() {
++		if (!on) return;
++		const char *out = getenv("PSP_DCACHE_OUT");
++		FILE *f = fopen(out ? out : "/tmp/claude-0/dcache.bin", "wb");
++		if (!f) return;
++		u64 header[2 + 7 * PHASES] = { 0x44434D33ULL /* "DCM3" */, (u64)PHASES };
++		for (int i = 0; i < PHASES; i++) {
++			header[2 + i] = total[i]; header[2 + PHASES + i] = missed[i]; header[2 + 2 * PHASES + i] = uncached[i];
++			header[2 + 3 * PHASES + i] = scratch[i]; header[2 + 4 * PHASES + i] = stores[i];
++			header[2 + 5 * PHASES + i] = ifetched[i]; header[2 + 6 * PHASES + i] = imissed[i];
++		}
++		fwrite(header, sizeof(header), 1, f);
++		fwrite(accesses.data(), 4, accesses.size(), f);
++		fwrite(misses.data(), 4, misses.size(), f);
++		fwrite(ifetches.data(), 4, ifetches.size(), f);
++		fwrite(imisses.data(), 4, imisses.size(), f);
++		fwrite(dmiss_pc.data(), 4, dmiss_pc.size(), f);
++		fclose(f);
++		u64 t = 0, m = 0;
++		for (int i = 0; i < PHASES; i++) { t += total[i]; m += missed[i]; }
++		fprintf(stderr, "DCACHE: %llu cached accesses, %llu misses (%.3f%%); %llu ticks\n", (unsigned long long)t,
++			(unsigned long long)m, t ? 100.0 * m / t : 0.0, (unsigned long long)ticks);
++	}
++	inline int current_phase() {
++		int phase = 0;
++		if (phase_addr) {
++			phase = (int)Memory::ReadUnchecked_U32(phase_addr);
++			if (phase < 0 || phase >= PHASES) phase = 0;
++		}
++		return phase;
++	}
++	inline void fetch(u32 pc) {
++		int phase = current_phase();
++		if (phase == 1 && last_phase != 1) ticks++;
++		last_phase = phase;
++		u32 p = pc & 0x1FFFFFFF;
++		bool hit = icache.access(p);
++		ifetched[phase]++;
++		if (!hit) imissed[phase]++;
++		if (p >= lo && p < hi) {
++			size_t i = (size_t)phase * ((hi - lo) >> 6) + ((p - lo) >> 6);
++			ifetches[i]++;
++			if (!hit) imisses[i]++;
++		}
++	}
++	inline void access(u32 addr, bool store, MIPSState *mips) {
++		int phase = current_phase();
++		if (store) stores[phase]++;
++		if ((addr & 0x1FFFC000) == 0x00010000) { scratch[phase]++; return; }
++		if (addr & 0x40000000) { uncached[phase]++; return; }
++		u32 p = addr & 0x1FFFFFFF;
++		u32 line = p >> 6, set = line & 127;
++		total[phase]++;
++		bool hit = true;
++		if (tag[set][0] == line) lru[set] = 1;
++		else if (tag[set][1] == line) lru[set] = 0;
++		else {
++			int victim = lru[set];
++			tag[set][victim] = line;
++			lru[set] = victim ^ 1;
++			missed[phase]++;
++			hit = false;
++			u32 pc = mips->pc & 0x1FFFFFFF;
++			if (pc >= lo && pc < hi)
++				dmiss_pc[(size_t)phase * ((hi - lo) >> 6) + ((pc - lo) >> 6)]++;
++		}
++		if (p >= lo && p < hi) {
++			size_t i = (size_t)phase * ((hi - lo) >> 6) + ((p - lo) >> 6);
++			accesses[i]++;
++			if (!hit) misses[i]++;
++		}
++	}
++};
++DCacheState g_dcache;
++struct DCacheDumper { ~DCacheDumper() { g_dcache.dump(); } } g_dcache_dumper;
++}
++void PSPDCacheDump() { g_dcache.dump(); g_dcache.on = false; }
++static inline void DCacheOp(MIPSOpcode op, MIPSState *mips) {
++	if (!g_dcache.init) g_dcache.setup();
++	if (!g_dcache.on) return;
++	g_dcache.fetch(mips->pc);
++	u32 code = op.encoding;
++	u32 opcode = code >> 26;
++	bool store;
++	s32 offset;
++	switch (opcode) {
++	case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x30: case 0x31:
++		store = false; offset = (s16)(code & 0xFFFF); break;
++	case 0x28: case 0x29: case 0x2A: case 0x2B: case 0x2E: case 0x38: case 0x39:
++		store = true; offset = (s16)(code & 0xFFFF); break;
++	case 0x32: case 0x35: case 0x36:  // lv.s, lvl/lvr.q, lv.q
++		store = false; offset = (s16)(code & 0xFFFC); break;
++	case 0x3A: case 0x3D: case 0x3E:  // sv.s, svl/svr.q, sv.q
++		store = true; offset = (s16)(code & 0xFFFC); break;
++	default:
++		return;
++	}
++	u32 rs = (code >> 21) & 31;
++	g_dcache.access(mips->r[rs] + offset, store, mips);
++}
+ static void RunUntilDowncountZeroFast(MIPSState *mips) {
+ 	while (mips->downcount >= 0 && coreState == CORE_RUNNING_CPU) {
+ 		int cycleCount = 0;
+@@ -1100,6 +1359,8 @@ static void RunUntilDowncountZeroFast(MIPSState *mips) {
+ 				return;
+ 			}
+ 			const MIPSOpcode op = MIPSOpcode(Memory::ReadUnchecked_U32(pc));
++			ICacheFetch(pc);
++			DCacheOp(op, mips);
+ 
+ 			const bool wasInDelaySlot = mips->inDelaySlot;
+ 			const int cycles = ExecInstruction(mips, op);
+@@ -1231,6 +1492,8 @@ static void RunUntilDowncountZeroWithChecks(MIPSState *mips, u64 globalTicks) {
+ 				return;
+ 			}
+ 			const MIPSOpcode op = MIPSOpcode(Memory::ReadUnchecked_U32(mips->pc));
++			ICacheFetch(mips->pc);
++			DCacheOp(op, mips);
+ 			// Replacements and similar are processed here, intentionally.
+ 			const MIPSInstruction *instr = MIPSGetInstruction(op);
+ 
+diff --git a/headless/Headless.cpp b/headless/Headless.cpp
+index 06c6177..d2a95f5 100644
+--- a/headless/Headless.cpp
++++ b/headless/Headless.cpp
+@@ -908,7 +908,7 @@ int main(int argc, const char* argv[]) {
+ 	g_Config.sProAdhocServer = "localhost";
+ 	g_Config.sMACAddress = "12:34:56:78:9A:BC";
+ 	g_Config.iFirmwareVersion = PSP_DEFAULT_FIRMWARE;
+-	g_Config.iPSPModel = PSP_MODEL_SLIM;
++	g_Config.iPSPModel = getenv("PPSSPP_FAT") ? PSP_MODEL_FAT : PSP_MODEL_SLIM; // PSP-1000 memory with PPSSPP_FAT (Halo port)
+ 	// Booting an ISO shouldn't rewrite the NAND out from under a test run - and the tests want
+ 	// whatever firmware is installed to stay put. Install one with --unpack-updater instead.
+ 	g_Config.bAutoUpgradeFirmware = false;
+diff --git a/Core/HLE/HLE.cpp b/Core/HLE/HLE.cpp
+index 2a41a5833..66a18a451 100644
+--- a/Core/HLE/HLE.cpp
++++ b/Core/HLE/HLE.cpp
+@@ -16,7 +16,10 @@
+ // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
+ 
+ #include <cstdarg>
++#include <cstdio>
++#include <cstdlib>
+ #include <map>
++#include <set>
+ #include <vector>
+ #include <string>
+ 
+@@ -1053,7 +1056,33 @@ static void UpdateSyscallStats(int modulenum, int funcnum, double total) {
+ 	}
+ }
+ 
++// local patch (Halo PSP port, 2026-10-10): PSP_MESTRICT=<hex address> names a
++// word in the game's memory that holds a thread's id while that thread runs
++// code meant for the Media Engine on the main CPU (simulated: this emulator
++// runs no ME code), and 0 otherwise. A system call that thread makes then is
++// one the ME couldn't make: each distinct function and caller is printed once,
++// "MESTRICT: <function> from <return address>". Other threads are unaffected.
++static void MeStrictCheck(const HLEFunction *info) {
++	static bool init = false;
++	static u32 addr = 0;
++	static std::set<std::pair<const HLEFunction *, u32>> seen;
++	if (!init) {
++		init = true;
++		if (const char *a = getenv("PSP_MESTRICT"))
++			addr = (u32)strtoul(a, nullptr, 16);
++	}
++	if (!addr || !Memory::IsValidAddress(addr))
++		return;
++	const u32 thread = Memory::ReadUnchecked_U32(addr);
++	if (thread == 0 || thread != (u32)__KernelGetCurThread())
++		return;
++	const u32 ra = currentMIPS->r[MIPS_REG_RA];
++	if (seen.size() < 500 && seen.insert(std::make_pair(info, ra)).second)
++		fprintf(stderr, "MESTRICT: %s from %08x\n", info->name ? info->name : "?", ra);
++}
++
+ static void CallSyscallWithFlags(const HLEFunction *info) {
++	MeStrictCheck(info);
+ 	// _dbg_assert_(g_stackSize == 0);
+ 	g_stackSize = 0;
+ 
+@@ -1094,6 +1123,7 @@ static void CallSyscallWithFlags(const HLEFunction *info) {
+ }
+ 
+ static void CallSyscallWithoutFlags(const HLEFunction *info) {
++	MeStrictCheck(info);
+ 	// _dbg_assert_(g_stackSize == 0);
+ 	g_stackSize = 0;
+ 

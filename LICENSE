@@ -1,0 +1,63 @@
+MIT License
+
+Copyright (c) 2026 The Sierra-III authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+-------------------------------------------------------------------------------
+What the MIT licence above does not cover
+-------------------------------------------------------------------------------
+
+The MIT licence covers Sierra-III's own code, scripts and documents. These
+files are not ours to license, or not under these terms:
+
+1. psp/xmb/campaign/PIC1.PNG, the campaign's XMB wallpaper, is made with
+   stills of Halo: Combat Evolved gameplay. It is used under Microsoft's
+   Game Content Usage Rules (https://www.xbox.com/en-US/developers/rules)
+   and is not under the MIT licence: it may be shared only as those rules
+   allow (not for commercial use). Halo: Combat Evolved (c) Microsoft
+   Corporation. Sierra-III is not endorsed by or affiliated with Microsoft.
+
+2. The project's own look is not under the MIT licence: the Sierra mark
+   (psp/xmb/sierra_mark.svg) and the XMB art made from it or for the
+   project (psp/xmb/campaign/ICON0.PNG, psp/xmb/mp/*.PNG). Copyright (c)
+   2026 The Sierra-III authors, all rights reserved: they may be shared only
+   as part of unmodified copies of Sierra-III. A fork picks its own look.
+
+3. Our patches to GPL programs keep those programs' licences:
+   - upstream/invader/*.patch, changes to Invader: GNU GPL version 3
+     (Invader's licence);
+   - tools/ppsspp_local_patches.diff, changes to PPSSPP: GNU GPL version 2
+     or later (PPSSPP's licence).
+
+4. Third-party files carried as they are, each under its own licence:
+   - psp/xmb/fonts/Audiowide-Regular.ttf: the Audiowide font by Astigmatic,
+     SIL Open Font License 1.1 (psp/xmb/fonts/OFL.txt);
+   - psp/include/GLES2/, psp/include/GLES3/, psp/include/KHR/: the Khronos
+     Group's OpenGL ES and KHR headers, under the MIT or Apache 2.0 licence
+     each names in its header;
+   - bake/bundle/licenses/: the Rust standard library's licence texts, as
+     the Rust project publishes them.
+
+The engine this port builds on (ChupathingyCE, CC0 1.0) is not in this
+repository: the build fetches it at the commit upstream/pins.env pins, and
+psp_fixups.py changes a copy of it. UPSTREAM.md lists every upstream, its pin
+and its licence. A built release carries the notices of the libraries linked
+into it (PSP/GAME/halo/licenses/), and each bake bundle carries LICENSES/ for
+the programs inside it.

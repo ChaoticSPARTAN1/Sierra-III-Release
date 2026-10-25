@@ -1,0 +1,1589 @@
+diff --git a/include/invader/build/build_workload.hpp b/include/invader/build/build_workload.hpp
+index 317c74a9..105d9165 100644
+--- a/include/invader/build/build_workload.hpp
++++ b/include/invader/build/build_workload.hpp
+@@ -46,6 +46,50 @@ namespace Invader {
+              * New scenario name?
+              */
+             std::optional<std::string> rename_scenario;
++
++            /**
++             * PSP port: write model vertex/index data and BSP material
++             * vertex data to this file instead of the map. Pointers to them
++             * in the map become 0x0C000000 + the file offset.
++             */
++            std::optional<std::string> psp_external_geometry;
++
++            /**
++             * PSP port: re-encode uncompressed animations in the engine's
++             * keyframe format, within these tolerances (degrees, world units)
++             */
++            std::optional<std::pair<double, double>> psp_animation_tolerance;
++
++            /**
++             * PSP port: with psp_external_geometry, also write each
++             * animation's frame data to that file (the port reads it through
++             * a cache); pointers to it become 0x0C000000 + the file offset
++             */
++            bool psp_external_animations = false;
++
++            /**
++             * PSP port: size the scenario's script node table to the nodes
++             * its scripts use plus this many spare (the console's expressions
++             * take spare nodes while they run), not the engine's 19,001
++             */
++            std::optional<std::size_t> psp_script_node_spare;
++
++            /**
++             * PSP port: leave out the BSPs' detail objects (the grass
++             * clusters): the port never draws them, and they sit in the tag
++             * window (a30_b: 0.64 MiB)
++             */
++            bool psp_no_detail_objects = false;
++
++            /**
++             * PSP port: blocks without the bytes the port never reads (sound
++             * permutations' names and subtitle data, pitch ranges' names, AI
++             * squads' unused fields, firing positions' padding); the port's
++             * own structs have these layouts (BuildWorkload::slim_psp_blocks,
++             * psp_tag_layouts.c). Needs the geometry pack (-G): its header
++             * tells the port which layouts the map has
++             */
++            bool psp_slim_blocks = false;
+             
+             /**
+              * Tags directories to use
+@@ -67,6 +111,15 @@ namespace Invader {
+              */
+             std::optional<std::vector<File::TagFilePath>> index;
+             
++            /**
++             * PSP port: the tag IDs the index gives, by tag index (0: none
++             * given there). A map built with them names each tag as the map
++             * the index was taken from does, its salt included: the network
++             * game sends tag IDs, and the Xbox maps' salts don't all follow
++             * the formula Invader uses
++             */
++            std::vector<std::uint32_t> psp_index_tag_ids;
++
+             /**
+              * Bitmap data
+              */
+@@ -96,6 +149,11 @@ namespace Invader {
+              * Optimize for space?
+              */
+             bool optimize_space = false;
++
++            /**
++             * Skip the tag data value checks? (stock tags can carry values the game never reads)
++             */
++            bool unchecked = false;
+             
+             /**
+              * Control how cache files are built. Changing these may result in an incompatible cache file
+@@ -297,6 +355,9 @@ namespace Invader {
+             /** This struct cannot be deduped */
+             bool unsafe_to_dedupe = false;
+ 
++            /** PSP port: this struct's data goes to the external geometry file */
++            bool external = false;
++
+             /** BSP index */
+             std::optional<std::size_t> bsp = 0;
+ 
+@@ -426,6 +487,27 @@ namespace Invader {
+         
+         /** Scenario index? */
+         std::size_t scenario_index;
++
++        /** PSP port: collision BSP tables to pack at 16 bits just before layout (model_collision_geometry.cpp) */
++        struct PSPCollisionBlocks {
++            std::optional<std::size_t> edges, surfaces, references;
++            std::size_t edge_count = 0, surface_count = 0, reference_count = 0;
++        };
++        std::vector<PSPCollisionBlocks> psp_collision_blocks;
++        void pack_psp_collision();
++        /** PSP port: -Z, see BuildParameters::psp_slim_blocks */
++        void slim_psp_blocks();
++        std::size_t slim_psp_block(const char *what, std::size_t element_size, const std::vector<std::pair<std::size_t, std::size_t>> &kept, const std::vector<std::size_t> &arrays);
++        std::size_t psp_slim_bytes = 0;
++
++        /** PSP port: animation keyframing tallies (psp_keyframes.cpp) */
++        std::size_t psp_animation_bytes_before = 0, psp_animation_bytes_after = 0, psp_animations_compressed = 0;
++
++        /** PSP port: animation frame data sent to the external file (model_animations.cpp) */
++        std::size_t psp_external_animation_count = 0, psp_external_animation_bytes = 0, psp_external_animation_largest = 0;
++        /** PSP port: what -D left out (BSPs, their detail object blocks' bytes) */
++        std::size_t psp_detail_object_bsps = 0, psp_detail_object_bytes = 0;
++        std::vector<std::size_t> psp_external_animation_structs;
+         
+         /** 
+          * Get the build parameters
+@@ -464,6 +546,13 @@ namespace Invader {
+         void generate_tag_array();
+         void dedupe_structs();
+         std::vector<std::vector<std::byte>> map_data_structs;
++
++        /** PSP port: data of the structs marked external, written to psp_external_geometry */
++        std::vector<std::byte> external_data;
++        static constexpr std::uint32_t PSP_EXTERNAL_BASE = 0x0C000000;
++        /** PSP port (-M): the animation cache's page; the header's word 7 says it */
++        static constexpr std::size_t PSP_ANIMATION_PAGE = 8192;
++        bool externalize_geometry() const noexcept { return this->parameters && this->parameters->psp_external_geometry.has_value(); }
+         std::vector<std::byte> all_raw_data;
+         std::size_t generate_tag_data();
+         void generate_bitmap_sound_data(std::size_t file_offset);
+diff --git a/src/build/build.cpp b/src/build/build.cpp
+index 56199eca..89dc7b03 100644
+--- a/src/build/build.cpp
++++ b/src/build/build.cpp
+@@ -4,6 +4,7 @@
+ #include <fstream>
+ #include <vector>
+ #include <cstring>
++#include <cstdlib>
+ #include <filesystem>
+ 
+ #include <invader/build/build_workload.hpp>
+@@ -66,12 +67,20 @@ int main(int argc, const char **argv) {
+         bool use_filesystem_path = false;
+         std::optional<std::string> rename_scenario;
+         bool optimize_space = false;
++        bool unchecked = false;
+         bool hide_pedantic_warnings = false;
+         std::optional<int> compression_level;
+         bool increased_file_size_limits = false;
+         std::optional<std::string> build_version;
+         bool check_custom_edition_resource_bounds = false;
+         std::optional<std::uint64_t> max_tag_space;
++        std::optional<std::uint64_t> tag_address;
++        std::optional<std::string> psp_geometry;
++        bool psp_external_animations = false;
++        std::optional<std::size_t> psp_script_node_spare;
++        bool psp_no_detail_objects = false;
++        bool psp_slim_blocks = false;
++        std::optional<std::pair<double, double>> psp_animations;
+         bool auto_forge = false;
+         bool do_not_auto_forge = false;
+         bool use_anniverary_mode = false;
+@@ -87,7 +96,7 @@ int main(int argc, const char **argv) {
+         CommandLineOption::from_preset(CommandLineOption::PRESET_COMMAND_LINE_OPTION_GAME_ENGINE),
+         CommandLineOption("quiet", 'q', 0, "Only output error messages."),
+         CommandLineOption("script-source", 'S', 1, "Specify the script source data location. Can be \"data\" or \"tags\". Default: tags", "<source>"),
+-        CommandLineOption("with-index", 'w', 1, "Use an index file for the tags, ensuring the map's tags are ordered in the same way.", "<file>"),
++        CommandLineOption("with-index", 'w', 1, "Use an index file for the tags, ensuring the map's tags are ordered in the same way. PSP port: a line may end in a tab and the tag's ID in hex, which the map then gives it.", "<file>"),
+         CommandLineOption("output", 'o', 1, "Output to a specific file.", "<file>"),
+         CommandLineOption("auto-forge", 'A', 0, "Ensure the map will be network compatible with the target engine's stock maps."),
+         CommandLineOption("forge-crc", 'C', 1, "Forge the CRC32 value of the map after building it.", "<crc>"),
+@@ -95,6 +104,14 @@ int main(int argc, const char **argv) {
+         CommandLineOption("level", 'l', 1, "Set the compression level (Xbox maps only). Must be between 0 and 9. Default: 9", "<level>"),
+         CommandLineOption("optimize", 'O', 0, "Optimize tag space. This will drastically increase the amount of time required to build the cache file."),
+         CommandLineOption("hide-pedantic-warnings", 'H', 0, "Don't show minor warnings."),
++        CommandLineOption("tag-address", 'X', 1, "Override the address the tag data is built for (hexadecimal, e.g. 0x09000000). For ports that load tags elsewhere in memory.", "<address>"),
++        CommandLineOption("psp-animations", 'K', 1, "PSP port: keyframe-compress uncompressed animations with the engine's own format, within <r>,<t>: r rotation degrees, t translation world units (e.g. 0.25,0.003).", "<r,t>"),
++        CommandLineOption("psp-geometry", 'G', 1, "PSP port: write model vertex/index data and BSP material vertex data to this file instead of the map; pointers to it become 0x0C000000 + file offset (Xbox maps only).", "<file>"),
++        CommandLineOption("psp-slim-blocks", 'Z', 0, "PSP port: sound permutations, pitch ranges, AI squads and firing positions without the bytes the port never reads (the port's own layouts; needs -G)."),
++        CommandLineOption("psp-no-detail-objects", 'D', 0, "PSP port: leave out the BSPs' detail objects (grass), which the port doesn't draw."),
++        CommandLineOption("psp-script-spare", 'Y', 1, "PSP port: size the script node table to the nodes in use plus this many spare, instead of the engine's maximum.", "<n>"),
++        CommandLineOption("psp-stream-anims", 'M', 0, "PSP port: with -G, also write each animation's frame data to that file; the port reads it through a cache."),
++        CommandLineOption("unchecked", 'U', 0, "Don't check tag data values. Stock tags carry a few out-of-range values the game never reads."),
+         CommandLineOption("extend-file-limits", 'E', 0, "Extend file size limits to 2 GiB regardless of if the target engine will support the cache file."),
+         CommandLineOption("build-string", 'B', 1, "Set the build string in the header.", "<ver>"),
+         CommandLineOption("stock-resource-bounds", 'b', 0, "Only index tags if the tag's index is within stock Custom Edition's resource map bounds. (Custom Edition only)"),
+@@ -216,6 +233,37 @@ int main(int argc, const char **argv) {
+             case 'O':
+                 build_options.optimize_space = true;
+                 break;
++            case 'U':
++                build_options.unchecked = true;
++                break;
++            case 'X':
++                build_options.tag_address = std::stoull(arguments[0], nullptr, 16);
++                break;
++            case 'G':
++                build_options.psp_geometry = arguments[0];
++                break;
++            case 'M':
++                build_options.psp_external_animations = true;
++                break;
++            case 'Y':
++                build_options.psp_script_node_spare = std::stoul(arguments[0]);
++                break;
++            case 'D':
++                build_options.psp_no_detail_objects = true;
++                break;
++            case 'Z':
++                build_options.psp_slim_blocks = true;
++                break;
++            case 'K': {
++                std::string arg = arguments[0];
++                auto comma = arg.find(',');
++                if(comma == std::string::npos) {
++                    eprintf_error("-K wants <rotation degrees>,<translation units>");
++                    std::exit(EXIT_FAILURE);
++                }
++                build_options.psp_animations = std::make_pair(std::stod(arg.substr(0, comma)), std::stod(arg.substr(comma + 1)));
++                break;
++            }
+             case 'H':
+                 build_options.hide_pedantic_warnings = true;
+                 break;
+@@ -297,6 +345,7 @@ int main(int argc, const char **argv) {
+     try {
+         // Get the index
+         std::optional<std::vector<File::TagFilePath>> with_index;
++        std::vector<std::uint32_t> with_index_tag_ids; // PSP port
+         if(build_options.index.size()) {
+             with_index = std::vector<File::TagFilePath>();
+ 
+@@ -314,6 +363,24 @@ int main(int argc, const char **argv) {
+                     break;
+                 }
+ 
++                // PSP port: the tag's ID may follow a tab, in hex
++                // ("path.group<TAB>E811069C"): the map is built with it, so
++                // its tags are named as in the map the index came from
++                std::uint32_t tag_id = 0;
++                auto tab = tag.find('\t');
++                if(tab != std::string::npos) {
++                    auto id_text = tag.substr(tab + 1);
++                    char *id_end = nullptr;
++                    unsigned long id_value = std::strtoul(id_text.c_str(), &id_end, 16);
++                    if(id_text.empty() || *id_end != 0 || id_value > 0xFFFFFFFFUL || (id_value & 0xFFFF) != with_index->size()) {
++                        eprintf_error("Invalid index given. \"%s\" has a tag ID that isn't its index's.", tag.c_str());
++                        return EXIT_FAILURE;
++                    }
++                    tag_id = static_cast<std::uint32_t>(id_value);
++                    tag = tag.substr(0, tab);
++                }
++                with_index_tag_ids.push_back(tag_id);
++
+                 // Get the extension
+                 const char *extension = nullptr;
+                 for(char &c : tag) {
+@@ -355,10 +422,29 @@ int main(int argc, const char **argv) {
+         parameters.data_directory = build_options.data;
+         parameters.scenario = scenario;
+         parameters.rename_scenario = build_options.rename_scenario;
++        parameters.psp_external_geometry = build_options.psp_geometry;
++        parameters.psp_animation_tolerance = build_options.psp_animations;
++        parameters.psp_external_animations = build_options.psp_external_animations;
++        parameters.psp_script_node_spare = build_options.psp_script_node_spare;
++        parameters.psp_no_detail_objects = build_options.psp_no_detail_objects;
++        parameters.psp_slim_blocks = build_options.psp_slim_blocks;
++        if(parameters.psp_external_animations && !parameters.psp_external_geometry.has_value()) {
++            eprintf_error("-M needs -G (the animations go into the geometry file)");
++            return EXIT_FAILURE;
++        }
++        if(parameters.psp_slim_blocks && !parameters.psp_external_geometry.has_value()) {
++            eprintf_error("-Z needs -G (the geometry file's header tells the port which layouts the map has)");
++            return EXIT_FAILURE;
++        }
+         parameters.optimize_space = build_options.optimize_space;
++        parameters.unchecked = build_options.unchecked;
+         parameters.forge_crc = build_options.forged_crc;
+         parameters.index = with_index;
++        parameters.psp_index_tag_ids = with_index_tag_ids;
+ 
++        if(build_options.tag_address.has_value()) {
++            parameters.details.build_tag_data_address = *build_options.tag_address;
++        }
+         if(build_options.max_tag_space.has_value()) {
+             parameters.details.build_maximum_tag_space = *build_options.max_tag_space;
+         }
+diff --git a/src/build/build_workload.cpp b/src/build/build_workload.cpp
+index 90ce795a..395e239f 100644
+--- a/src/build/build_workload.cpp
++++ b/src/build/build_workload.cpp
+@@ -54,6 +54,7 @@ namespace Invader {
+     std::vector<std::byte> BuildWorkload::compile_map(const BuildParameters &parameters) {
+         BuildWorkload workload;
+         workload.parameters = &parameters;
++        workload.disable_error_checking = parameters.unchecked;
+ 
+         // Start benchmark
+         workload.start = std::chrono::steady_clock::now();
+@@ -413,12 +414,86 @@ namespace Invader {
+                 }
+             }
+             else {
+-                header.crc32 = UINT32_MAX;
++                // Xbox: the game keeps a decompressed copy of each map in its
++                // Z: cache and reuses it while the header checksum matches, so
++                // a fixed value would make every rebuild of a map look like
++                // the cached one. Checksum the map body instead.
++                header.crc32 = ~crc32_buffer(0, final_data.data() + sizeof(HEK::CacheFileHeader), final_data.size() - sizeof(HEK::CacheFileHeader));
++                if(header.crc32 == UINT32_MAX) {
++                    header.crc32 = 0;
++                }
+             }
+ 
+             // Set the file size
+             header.decompressed_file_size = final_data.size();
+ 
++            // PSP port: what the animation keyframing saved
++            if(workload.parameters->psp_animation_tolerance.has_value() && workload.parameters->verbosity > BuildParameters::BuildVerbosity::BUILD_VERBOSITY_QUIET) {
++                oprintf("Animations keyframed: %zu; frame data %.02f -> %.02f MiB\n", workload.psp_animations_compressed, BYTES_TO_MiB(workload.psp_animation_bytes_before), BYTES_TO_MiB(workload.psp_animation_bytes_after));
++            }
++
++            // PSP port: what -D left out
++            if(workload.parameters->psp_no_detail_objects && workload.parameters->verbosity > BuildParameters::BuildVerbosity::BUILD_VERBOSITY_QUIET) {
++                oprintf("Detail objects left out: %zu BSPs, %.02f MiB\n", workload.psp_detail_object_bsps, BYTES_TO_MiB(workload.psp_detail_object_bytes));
++            }
++
++            // PSP port: what left the map with the animations (-M)
++            if(workload.parameters->psp_external_animations && workload.parameters->verbosity > BuildParameters::BuildVerbosity::BUILD_VERBOSITY_QUIET) {
++                oprintf("External animations: %zu, %.02f MiB of frame data (largest %zu bytes)\n", workload.psp_external_animation_count, BYTES_TO_MiB(workload.psp_external_animation_bytes), workload.psp_external_animation_largest);
++            }
++
++            // PSP port: the external geometry file. Header: "PGEO", version 1,
++            // the map's checksum (so a stale file is refused), the data size,
++            // then (-M) the animation frame data's bytes, the range of the data
++            // it lies in (offsets from the data's start) and the page it is
++            // laid out for (all four 0 for a map whose animations stay in its
++            // tags); then the tag window's part neither the tags nor any BSP
++            // ever use (address and bytes: from the end of the tag data to
++            // where the largest BSP starts; the port's animation cache can
++            // live there); then the data, 64-byte aligned from the header's end
++            if(workload.externalize_geometry()) {
++                auto &path = workload.parameters->psp_external_geometry.value();
++                std::FILE *f = std::fopen(path.c_str(), "wb");
++                if(!f) {
++                    REPORT_ERROR_PRINTF(workload, ERROR_TYPE_FATAL_ERROR, std::nullopt, "Failed to open %s for writing", path.c_str());
++                    throw std::exception();
++                }
++                std::uint32_t file_header[16] = {};
++                file_header[0] = 0x4F454750; // "PGEO"
++                file_header[1] = 1;
++                file_header[2] = header.crc32;
++                file_header[3] = static_cast<std::uint32_t>(workload.external_data.size());
++                if(!workload.psp_external_animation_structs.empty()) {
++                    std::size_t first = SIZE_MAX, end = 0;
++                    for(auto index : workload.psp_external_animation_structs) {
++                        auto &s = workload.structs[index];
++                        first = std::min(first, *s.offset);
++                        end = std::max(end, *s.offset + s.data.size());
++                    }
++                    file_header[4] = static_cast<std::uint32_t>(workload.psp_external_animation_bytes);
++                    file_header[5] = static_cast<std::uint32_t>(first);
++                    file_header[6] = static_cast<std::uint32_t>(end);
++                    file_header[7] = static_cast<std::uint32_t>(BuildWorkload::PSP_ANIMATION_PAGE);
++                }
++                // word 10: the formats the port must know of; -Z's slim blocks, bits 0-3 (slim_psp_blocks)
++                file_header[10] = workload.parameters->psp_slim_blocks ? 0xF : 0;
++                {
++                    std::uint64_t window = workload.parameters->details.build_tag_data_address;
++                    std::uint64_t gap_start = window + ((workload.indexed_data_amount + tag_data_size + 63) & ~static_cast<std::uint64_t>(63));
++                    std::uint64_t gap_end = (window + workload.parameters->details.build_maximum_tag_space - largest_bsp_size) & ~static_cast<std::uint64_t>(63);
++                    if(gap_end > gap_start) {
++                        file_header[8] = static_cast<std::uint32_t>(gap_start);
++                        file_header[9] = static_cast<std::uint32_t>(gap_end - gap_start);
++                    }
++                }
++                std::fwrite(file_header, sizeof(file_header), 1, f);
++                std::fwrite(workload.external_data.data(), workload.external_data.size(), 1, f);
++                std::fclose(f);
++                if(workload.parameters->verbosity > BuildParameters::BuildVerbosity::BUILD_VERBOSITY_QUIET) {
++                    oprintf("External geometry: %.02f MiB -> %s\n", BYTES_TO_MiB(workload.external_data.size()), path.c_str());
++                }
++            }
++
+             // Copy it again, this time with the new CRC32
+             if(cache_version == HEK::CacheFileEngine::CACHE_FILE_DEMO) {
+                 *reinterpret_cast<HEK::CacheFileDemoHeader *>(final_data.data()) = *reinterpret_cast<HEK::CacheFileHeader *>(&header);
+@@ -1176,11 +1251,232 @@ namespace Invader {
+         }
+     }
+ 
++    // PSP port: a collision BSP's edges, surfaces and bsp2d references at
++    // 16 bits (invader-build -G); see model_collision_geometry.cpp. Done just
++    // before layout, after every build-time reader of the tables.
++    void BuildWorkload::pack_psp_collision() {
++        auto flag16 = [this](std::uint32_t v, const char *what) -> std::uint16_t {
++            std::uint32_t index = v & 0x7FFFFFFF;
++            if(index > 0x7FFF) {
++                REPORT_ERROR_PRINTF(*this, ERROR_TYPE_FATAL_ERROR, std::nullopt, "PSP collision: %s index %u does not fit 15 bits", what, index);
++                throw InvalidTagDataException();
++            }
++            return static_cast<std::uint16_t>(index | ((v & 0x80000000) ? 0x8000 : 0));
++        };
++        auto plain16 = [this](std::uint32_t v, const char *what) -> std::uint16_t {
++            if(v > 0xFFFE) {
++                REPORT_ERROR_PRINTF(*this, ERROR_TYPE_FATAL_ERROR, std::nullopt, "PSP collision: %s index %u does not fit 16 bits", what, v);
++                throw InvalidTagDataException();
++            }
++            return static_cast<std::uint16_t>(v);
++        };
++        std::size_t packed_structs = 0;
++        for(auto &b : this->psp_collision_blocks) {
++            if(b.edges.has_value()) {
++                auto &es = this->structs[*b.edges];
++                if(es.data.size() >= b.edge_count * 24) {
++                    std::vector<std::byte> packed(b.edge_count * 12);
++                    for(std::size_t i = 0; i < b.edge_count; i++) {
++                        std::uint32_t v[6]; std::uint16_t w[6];
++                        std::memcpy(v, es.data.data() + i * 24, 24);
++                        w[0] = plain16(v[0], "edge vertex"); w[1] = plain16(v[1], "edge vertex");
++                        w[2] = plain16(v[2], "edge edge"); w[3] = plain16(v[3], "edge edge");
++                        w[4] = plain16(v[4], "edge surface"); w[5] = plain16(v[5], "edge surface");
++                        std::memcpy(packed.data() + i * 12, w, 12);
++                    }
++                    es.data = packed; packed_structs++;
++                }
++            }
++            if(b.surfaces.has_value()) {
++                auto &ss = this->structs[*b.surfaces];
++                if(ss.data.size() >= b.surface_count * 12) {
++                    std::vector<std::byte> packed(b.surface_count * 8);
++                    for(std::size_t i = 0; i < b.surface_count; i++) {
++                        const std::byte *src = ss.data.data() + i * 12;
++                        std::uint32_t plane, first_edge;
++                        std::memcpy(&plane, src, 4); std::memcpy(&first_edge, src + 4, 4);
++                        std::uint16_t p16 = flag16(plane, "surface plane"), e16 = plain16(first_edge, "surface first edge");
++                        std::byte *dst = packed.data() + i * 8;
++                        std::memcpy(dst, &p16, 2); std::memcpy(dst + 2, &e16, 2); std::memcpy(dst + 4, src + 8, 4);
++                    }
++                    ss.data = packed; packed_structs++;
++                }
++            }
++            if(b.references.has_value()) {
++                auto &rs = this->structs[*b.references];
++                if(rs.data.size() >= b.reference_count * 8) {
++                    std::vector<std::byte> packed(b.reference_count * 4);
++                    for(std::size_t i = 0; i < b.reference_count; i++) {
++                        std::uint32_t plane, node;
++                        std::memcpy(&plane, rs.data.data() + i * 8, 4); std::memcpy(&node, rs.data.data() + i * 8 + 4, 4);
++                        std::uint16_t p16 = flag16(plane, "reference plane"), n16 = flag16(node, "reference bsp2d node");
++                        std::memcpy(packed.data() + i * 4, &p16, 2); std::memcpy(packed.data() + i * 4 + 2, &n16, 2);
++                    }
++                    rs.data = packed; packed_structs++;
++                }
++            }
++        }
++        if(packed_structs && this->parameters->verbosity > BuildParameters::BuildVerbosity::BUILD_VERBOSITY_QUIET) {
++            oprintf("PSP collision: %zu tables packed in %zu BSPs\n", packed_structs, this->psp_collision_blocks.size());
++        }
++        this->psp_collision_blocks.clear();
++    }
++
++    // PSP port (-Z): tag blocks whose elements carry bytes the port never
++    // reads (names it only prints, padding, subtitles) are written without
++    // them, just before layout, like the collision packing. Each rule names a
++    // block, its Xbox element size and the byte ranges kept, in order; the
++    // port's own structs have the slim layout (psp_fixups.py FIXES_108), and
++    // the geometry pack's header word 10 says which rules a map was built
++    // with (one bit each; the port reads older maps as they are).
++    //   bit 0  sound permutations: no name (32), no subtitle data (20): 124 -> 72
++    //   bit 1  sound pitch ranges: no name (32): 72 -> 40
++    //   bit 2  AI squads: no name (32), no trailing unused block (12): 232 -> 188
++    //   bit 3  AI firing positions: no padding (4, before the surface index): 24 -> 20
++    // generate_bitmap_sound_data finds the samples' file offset at the slim
++    // permutation's place.
++    static constexpr std::size_t PSP_PERMUTATION_SIZE = 124, PSP_PERMUTATION_KEEP_FROM = 32, PSP_PERMUTATION_KEEP_TO = 104;
++    static constexpr std::size_t PSP_SLIM_PERMUTATION_SIZE = PSP_PERMUTATION_KEEP_TO - PSP_PERMUTATION_KEEP_FROM;
++
++    struct PSPSlimRule {
++        const char *what;
++        std::uint32_t bit;
++        std::size_t element_size;
++        std::vector<std::pair<std::size_t, std::size_t>> kept; // [from, to) of the Xbox element, in order
++    };
++
++    // the arrays of every block a rule covers, each once (deduplicated structs are shared)
++    static void psp_slim_add(std::vector<std::size_t> &arrays, std::optional<std::size_t> index) {
++        if(index.has_value() && std::find(arrays.begin(), arrays.end(), *index) == arrays.end()) {
++            arrays.push_back(*index);
++        }
++    }
++
++    std::size_t BuildWorkload::slim_psp_block(const char *what, std::size_t element_size, const std::vector<std::pair<std::size_t, std::size_t>> &kept, const std::vector<std::size_t> &arrays) {
++        std::size_t slim_size = 0;
++        for(auto &k : kept) {
++            slim_size += k.second - k.first;
++        }
++        // where an Xbox offset goes, or SIZE_MAX if it is left out
++        auto place = [&kept](std::size_t within) -> std::size_t {
++            std::size_t at = 0;
++            for(auto &k : kept) {
++                if(within >= k.first && within < k.second) {
++                    return at + within - k.first;
++                }
++                at += k.second - k.first;
++            }
++            return SIZE_MAX;
++        };
++        std::size_t saved = 0, elements = 0;
++        for(auto index : arrays) {
++            auto &array = this->structs[index];
++            std::size_t count = array.data.size() / element_size;
++            if(count * element_size != array.data.size()) {
++                REPORT_ERROR_PRINTF(*this, ERROR_TYPE_FATAL_ERROR, std::nullopt, "PSP slim %s: an array of %zu bytes isn't whole elements of %zu", what, array.data.size(), element_size);
++                throw InvalidTagDataException();
++            }
++            std::vector<std::byte> slim(count * slim_size);
++            for(std::size_t i = 0; i < count; i++) {
++                std::size_t at = i * slim_size;
++                for(auto &k : kept) {
++                    std::memcpy(slim.data() + at, array.data.data() + i * element_size + k.first, k.second - k.first);
++                    at += k.second - k.first;
++                }
++            }
++            std::vector<BuildWorkloadStructPointer> pointers;
++            for(auto p : array.pointers) {
++                std::size_t element = p.offset / element_size, moved = place(p.offset % element_size);
++                if(moved == SIZE_MAX) {
++                    // what pointed from a left-out part (a permutation's subtitle data) stays in the tag data, unreferenced
++                    REPORT_ERROR_PRINTF(*this, ERROR_TYPE_WARNING, std::nullopt, "PSP slim %s: data pointed to from a left-out part stays unreferenced", what);
++                    continue;
++                }
++                p.offset = element * slim_size + moved;
++                pointers.push_back(p);
++            }
++            for(auto &d : array.dependencies) {
++                std::size_t element = d.offset / element_size, moved = place(d.offset % element_size);
++                if(moved == SIZE_MAX) {
++                    REPORT_ERROR_PRINTF(*this, ERROR_TYPE_FATAL_ERROR, std::nullopt, "PSP slim %s: a tag reference in a left-out part", what);
++                    throw InvalidTagDataException();
++                }
++                d.offset = element * slim_size + moved;
++            }
++            saved += array.data.size() - slim.size();
++            elements += count;
++            array.data = std::move(slim);
++            array.pointers = std::move(pointers);
++        }
++        if(this->parameters->verbosity > BuildParameters::BuildVerbosity::BUILD_VERBOSITY_QUIET) {
++            oprintf("PSP slim %s: %zu in %zu arrays, %zu -> %zu bytes each, %.02f MiB saved\n", what, elements, arrays.size(), element_size, slim_size, BYTES_TO_MiB(saved));
++        }
++        this->psp_slim_bytes += saved;
++        return saved;
++    }
++
++    void BuildWorkload::slim_psp_blocks() {
++        static_assert(sizeof(Parser::SoundPermutation::struct_little) == PSP_PERMUTATION_SIZE, "the Xbox permutation is 124 bytes");
++        static_assert(sizeof(Parser::SoundPitchRange::struct_little) == 72, "the Xbox pitch range is 72 bytes");
++        static_assert(sizeof(Parser::ScenarioSquad::struct_little) == 232, "the Xbox squad is 232 bytes");
++        static_assert(sizeof(Parser::ScenarioFiringPosition::struct_little) == 24, "the Xbox firing position is 24 bytes");
++        std::vector<std::size_t> permutations, pitch_ranges, squads, firing_positions;
++        for(auto &t : this->tags) {
++            if(!t.base_struct.has_value()) {
++                continue;
++            }
++            auto &base = this->structs[*t.base_struct];
++            if(t.tag_fourcc == TagFourCC::TAG_FOURCC_SOUND) {
++                auto &sound = *reinterpret_cast<Parser::Sound::struct_little *>(base.data.data());
++                if(sound.pitch_ranges.count.read() == 0) {
++                    continue;
++                }
++                auto pitch_range_index = base.resolve_pointer(&sound.pitch_ranges.pointer);
++                psp_slim_add(pitch_ranges, pitch_range_index);
++                auto &pitch_range_struct = this->structs[*pitch_range_index];
++                auto *ranges = reinterpret_cast<Parser::SoundPitchRange::struct_little *>(pitch_range_struct.data.data());
++                for(std::size_t pr = 0; pr < sound.pitch_ranges.count.read(); pr++) {
++                    if(ranges[pr].permutations.count.read() > 0) {
++                        psp_slim_add(permutations, pitch_range_struct.resolve_pointer(&ranges[pr].permutations.pointer));
++                    }
++                }
++            }
++            else if(t.tag_fourcc == TagFourCC::TAG_FOURCC_SCENARIO) {
++                auto &scenario = *reinterpret_cast<Parser::Scenario::struct_little *>(base.data.data());
++                if(scenario.encounters.count.read() == 0) {
++                    continue;
++                }
++                auto &encounter_struct = this->structs[*base.resolve_pointer(&scenario.encounters.pointer)];
++                auto *encounters = reinterpret_cast<Parser::ScenarioEncounter::struct_little *>(encounter_struct.data.data());
++                for(std::size_t e = 0; e < scenario.encounters.count.read(); e++) {
++                    if(encounters[e].squads.count.read() > 0) {
++                        psp_slim_add(squads, encounter_struct.resolve_pointer(&encounters[e].squads.pointer));
++                    }
++                    if(encounters[e].firing_positions.count.read() > 0) {
++                        psp_slim_add(firing_positions, encounter_struct.resolve_pointer(&encounters[e].firing_positions.pointer));
++                    }
++                }
++            }
++        }
++        // children before parents: a permutation array's place is read from its pitch range
++        this->slim_psp_block("sound permutations", PSP_PERMUTATION_SIZE, {{PSP_PERMUTATION_KEEP_FROM, PSP_PERMUTATION_KEEP_TO}}, permutations);
++        this->slim_psp_block("sound pitch ranges", 72, {{32, 72}}, pitch_ranges);
++        this->slim_psp_block("AI squads", 232, {{0, 48}, {76, 148}, {196, 220}}, squads);
++        this->slim_psp_block("AI firing positions", 24, {{0, 16}, {20, 24}}, firing_positions);
++    }
++
+     std::size_t BuildWorkload::generate_tag_data() {
+         auto &structs = this->structs;
+         auto &tags = this->tags;
+         std::size_t tag_count = tags.size();
+ 
++        if(this->externalize_geometry()) {
++            this->pack_psp_collision();
++        }
++        if(this->parameters->psp_slim_blocks) {
++            this->slim_psp_blocks();
++        }
++
+         // Pointer offset to what struct
+         struct PointerInternal {
+             std::size_t from_offset;
+@@ -1199,7 +1495,33 @@ namespace Invader {
+ 
+         auto &cache_version = this->parameters->details.build_cache_file_engine;
+ 
+-        auto recursively_generate_data = [&structs, &tags, &pointers, &pointers_64_bit, &pointer_of_tag_path, &cache_version](std::vector<std::byte> &data, std::size_t struct_index, auto &recursively_generate_data) {
++        auto &external_data = this->external_data;
++
++        // PSP port (-M): the animations' frame data first, together and in
++        // compile order (a graph's animations side by side), so the port's
++        // animation cache reads pages of animations and nothing else. The
++        // cache reads 8 KB pages; an animation that would cross into the next
++        // page starts on it instead, so one no larger than a page is read
++        // whole with one page (tools/anim_cache_sim.py: on b30's beach this
++        // layout misses 6x less than packing them end to end)
++        for(auto index : this->psp_external_animation_structs) {
++            auto &s = structs[index];
++            if(s.offset.has_value()) {
++                continue;
++            }
++            external_data.insert(external_data.end(), REQUIRED_PADDING_N_BYTES(external_data.size(), 16), std::byte());
++            auto in_page = external_data.size() % PSP_ANIMATION_PAGE;
++            if(s.data.size() <= PSP_ANIMATION_PAGE && in_page + s.data.size() > PSP_ANIMATION_PAGE) {
++                external_data.insert(external_data.end(), PSP_ANIMATION_PAGE - in_page, std::byte());
++            }
++            s.offset = external_data.size();
++            external_data.insert(external_data.end(), s.data.begin(), s.data.end());
++        }
++
++        // PSP port: the tag IDs the index gave (-w)
++        auto &psp_index_tag_ids = this->parameters->psp_index_tag_ids;
++
++        auto recursively_generate_data = [&structs, &tags, &pointers, &pointers_64_bit, &pointer_of_tag_path, &cache_version, &external_data, &psp_index_tag_ids](std::vector<std::byte> &data, std::size_t struct_index, auto &recursively_generate_data) {
+             auto &s = structs[struct_index];
+ 
+             // Return the pointer thingy
+@@ -1207,6 +1529,16 @@ namespace Invader {
+                 return;
+             }
+ 
++            // PSP port: an external struct's data goes to the geometry file,
++            // 64-byte aligned; its offset is the file offset, and pointers to
++            // it resolve to PSP_EXTERNAL_BASE + offset. It holds no pointers.
++            if(s.external) {
++                external_data.insert(external_data.end(), REQUIRED_PADDING_N_BYTES(external_data.size(), 64), std::byte());
++                s.offset = external_data.size();
++                external_data.insert(external_data.end(), s.data.begin(), s.data.end());
++                return;
++            }
++
+             // Set the offset thingy
+             std::size_t offset = data.size();
+             s.offset = offset;
+@@ -1228,6 +1560,10 @@ namespace Invader {
+             for(auto &dependency : s.dependencies) {
+                 auto tag_index = dependency.tag_index;
+                 std::uint32_t full_id = static_cast<std::uint32_t>((tag_index + 0x6174) | 0x8000) << 16 | static_cast<std::uint16_t>(tag_index); // salt = (0x6174 'at' | 0x8000) + index
++                // PSP port: the index's ID, when it gives one (build.cpp checks its low half is the index)
++                if(tag_index < psp_index_tag_ids.size() && psp_index_tag_ids[tag_index] != 0) {
++                    full_id = psp_index_tag_ids[tag_index];
++                }
+                 HEK::TagID new_tag_id = { full_id };
+ 
+                 if(dependency.tag_id_only) {
+@@ -1254,11 +1590,15 @@ namespace Invader {
+ 
+         // Adjust the pointers
+         for(auto &p : pointers) {
+-            *reinterpret_cast<HEK::LittleEndian<HEK::Pointer> *>(tag_data_b + p.from_offset) = static_cast<HEK::Pointer>(name_tag_data_pointer + *this->structs[p.to_struct].offset + p.to_offset);
++            auto &struct_pointed_to = this->structs[p.to_struct];
++            auto base = struct_pointed_to.external ? static_cast<HEK::Pointer64>(PSP_EXTERNAL_BASE) : name_tag_data_pointer;
++            *reinterpret_cast<HEK::LittleEndian<HEK::Pointer> *>(tag_data_b + p.from_offset) = static_cast<HEK::Pointer>(base + *struct_pointed_to.offset + p.to_offset);
+         }
+ 
+         for(auto &p : pointers_64_bit) {
+-            *reinterpret_cast<HEK::LittleEndian<HEK::Pointer64> *>(tag_data_b + p.from_offset) = static_cast<HEK::Pointer64>(name_tag_data_pointer + *this->structs[p.to_struct].offset + p.to_offset);
++            auto &struct_pointed_to = this->structs[p.to_struct];
++            auto base = struct_pointed_to.external ? static_cast<HEK::Pointer64>(PSP_EXTERNAL_BASE) : name_tag_data_pointer;
++            *reinterpret_cast<HEK::LittleEndian<HEK::Pointer64> *>(tag_data_b + p.from_offset) = static_cast<HEK::Pointer64>(base + *struct_pointed_to.offset + p.to_offset);
+         }
+ 
+         // Get the tag path pointers working
+@@ -1332,12 +1672,12 @@ namespace Invader {
+                     // Chu
+                     for(auto &p : pointers) {
+                         auto &struct_pointed_to = this->structs[p.to_struct];
+-                        auto base = struct_pointed_to.bsp.has_value() ? tag_data_base : name_tag_data_pointer;
++                        auto base = struct_pointed_to.external ? static_cast<HEK::Pointer64>(PSP_EXTERNAL_BASE) : struct_pointed_to.bsp.has_value() ? tag_data_base : name_tag_data_pointer;
+                         *reinterpret_cast<HEK::LittleEndian<HEK::Pointer> *>(tag_data_b + p.from_offset) = static_cast<HEK::Pointer>(base + *struct_pointed_to.offset + p.to_offset);
+                     }
+                     for(auto &p : pointers_64_bit) {
+                         auto &struct_pointed_to = this->structs[p.to_struct];
+-                        auto base = struct_pointed_to.bsp.has_value() ? tag_data_base : name_tag_data_pointer;
++                        auto base = struct_pointed_to.external ? static_cast<HEK::Pointer64>(PSP_EXTERNAL_BASE) : struct_pointed_to.bsp.has_value() ? tag_data_base : name_tag_data_pointer;
+                         *reinterpret_cast<HEK::LittleEndian<HEK::Pointer64> *>(tag_data_b + p.from_offset) = static_cast<HEK::Pointer64>(base + *struct_pointed_to.offset + p.to_offset);
+                     }
+ 
+@@ -1441,13 +1781,19 @@ namespace Invader {
+                 auto &sound_header = *reinterpret_cast<Parser::Sound::struct_little *>(sound_struct.data.data());
+                 std::size_t pitch_range_count = sound_header.pitch_ranges.count.read();
+                 auto &pitch_range_struct = this->structs[*sound_struct.resolve_pointer(&sound_header.pitch_ranges.pointer)];
+-                auto *pitch_range_array = reinterpret_cast<Parser::SoundPitchRange::struct_little *>(pitch_range_struct.data.data());
++                // PSP port (-Z): the slim pitch range starts 32 bytes into the Xbox one
++                bool slim_ranges = this->parameters->psp_slim_blocks;
++                std::size_t range_stride = slim_ranges ? 40 : sizeof(Parser::SoundPitchRange::struct_little), range_shift = slim_ranges ? 32 : 0;
+                 for(std::size_t pr = 0; pr < pitch_range_count; pr++) {
+-                    auto &pitch_range = pitch_range_array[pr];
++                    auto &pitch_range = *reinterpret_cast<Parser::SoundPitchRange::struct_little *>(pitch_range_struct.data.data() + pr * range_stride - range_shift);
+                     std::size_t permutation_count = pitch_range.permutations.count.read();
+-                    auto *permutation_array = reinterpret_cast<Parser::SoundPermutation::struct_little *>(this->map_data_structs[0].data() + *this->structs[*pitch_range_struct.resolve_pointer(&pitch_range.permutations.pointer)].offset);
++                    auto *permutation_bytes = this->map_data_structs[0].data() + *this->structs[*pitch_range_struct.resolve_pointer(&pitch_range.permutations.pointer)].offset;
++                    // PSP port (-Z): the slim layout starts 32 bytes into the Xbox one
++                    bool slim = this->parameters->psp_slim_blocks;
++                    std::size_t stride = slim ? PSP_SLIM_PERMUTATION_SIZE : sizeof(Parser::SoundPermutation::struct_little);
++                    std::size_t shift = slim ? PSP_PERMUTATION_KEEP_FROM : 0;
+                     for(std::size_t pe = 0; pe < permutation_count; pe++) {
+-                        auto &permutation = permutation_array[pe];
++                        auto &permutation = *reinterpret_cast<Parser::SoundPermutation::struct_little *>(permutation_bytes + pe * stride - shift);
+                         auto &index = t.asset_data[resource_index++];
+                         if(index == static_cast<std::size_t>(~0)) {
+                             continue;
+@@ -2349,6 +2695,10 @@ namespace Invader {
+         auto &vertices_array_struct = this->structs[vertices_array_struct_index];
+         auto &indices_data_struct = this->structs[indices_data_struct_index];
+         auto &vertices_data_struct = this->structs[vertices_data_struct_index];
++        if(this->externalize_geometry()) {
++            indices_data_struct.external = true;
++            vertices_data_struct.external = true;
++        }
+ 
+         // Add an entry for each part
+         auto *indices_array_data = reinterpret_cast<HEK::CacheFileModelPartIndicesXbox *>((indices_array_struct.data = std::vector<std::byte>(part_count * sizeof(HEK::CacheFileModelPartIndicesXbox))).data());
+diff --git a/src/build/build_workload_dedupe.cpp b/src/build/build_workload_dedupe.cpp
+index 4fb2155c..6dfdce10 100644
+--- a/src/build/build_workload_dedupe.cpp
++++ b/src/build/build_workload_dedupe.cpp
+@@ -5,7 +5,7 @@ namespace Invader {
+         std::size_t this_size = this->data.size();
+         std::size_t other_size = other.data.size();
+         
+-        if(this->unsafe_to_dedupe || other.unsafe_to_dedupe || this->bsp != other.bsp || other_size > this_size) {
++        if(this->unsafe_to_dedupe || other.unsafe_to_dedupe || this->bsp != other.bsp || this->external != other.external || other_size > this_size) {
+             return false;
+         }
+         
+diff --git a/src/invader.cmake b/src/invader.cmake
+index 49659552..155b94ad 100644
+--- a/src/invader.cmake
++++ b/src/invader.cmake
+@@ -104,6 +104,7 @@ set(INVADER_SOURCE_FILES
+     src/tag/parser/compile/meter.cpp
+     src/tag/parser/compile/model.cpp
+     src/tag/parser/compile/model_animations.cpp
++    src/tag/parser/compile/psp_keyframes.cpp
+     src/tag/parser/compile/model_collision_geometry.cpp
+     src/tag/parser/compile/object.cpp
+     src/tag/parser/compile/particle.cpp
+diff --git a/src/tag/hek/definition/model_animations.json b/src/tag/hek/definition/model_animations.json
+index b113511b..0ab20d12 100644
+--- a/src/tag/hek/definition/model_animations.json
++++ b/src/tag/hek/definition/model_animations.json
+@@ -844,6 +844,7 @@
+         "post_cache_deformat": true,
+         "title": "name",
+         "pre_compile": true,
++        "post_compile": true,
+         "size": 180
+     },
+     {
+diff --git a/src/tag/hek/definition/model_collision_geometry.json b/src/tag/hek/definition/model_collision_geometry.json
+index 9b080f18..b95e609f 100644
+--- a/src/tag/hek/definition/model_collision_geometry.json
++++ b/src/tag/hek/definition/model_collision_geometry.json
+@@ -434,7 +434,8 @@
+         "type": "struct",
+         "pre_compile": true,
+         "read_only": true,
+-        "size": 96
++        "size": 96,
++        "post_compile": true
+     },
+     {
+         "name": "ModelCollisionGeometryNode",
+@@ -739,4 +740,4 @@
+         "size": 664,
+         "class": "model_collision_geometry"
+     }
+-]
++]
+\ No newline at end of file
+diff --git a/src/tag/parser/compile/model_animations.cpp b/src/tag/parser/compile/model_animations.cpp
+index 5c6f9179..405bf49e 100644
+--- a/src/tag/parser/compile/model_animations.cpp
++++ b/src/tag/parser/compile/model_animations.cpp
+@@ -9,6 +9,8 @@ namespace Invader::Parser {
+         return (fields[offset / 32] & bitfield) != 0;
+     }
+ 
++    bool psp_keyframe_compress(ModelAnimationsAnimation &animation, double rotation_tolerance, double translation_tolerance, std::size_t &bytes_before, std::size_t &bytes_after);
++
+     std::size_t expected_uncompressed_frame_size_for_animation(ModelAnimationsAnimation &animation) noexcept {
+         std::size_t total_size = 0;
+         for(std::size_t i = 0; i < animation.node_count; i++) {
+@@ -122,6 +124,35 @@ namespace Invader::Parser {
+         }
+     }
+ 
++    // PSP port (-M): the frame data leaves the map for the geometry file, as
++    // the model and level vertices do with -G. The game reads frame data only
++    // while it evaluates an animation (animation_get_frame_data and the
++    // keyframe readers), so the port reads it through a cache; the rest of the
++    // animation (frame info, default data, flags) stays in the map, where the
++    // game's logic reads it. The frame data holds no pointers.
++    void ModelAnimationsAnimation::post_compile(BuildWorkload &workload, std::size_t, std::size_t struct_index, std::size_t offset) {
++        auto *parameters = workload.get_build_parameters();
++        if(!parameters->psp_external_animations || !parameters->psp_external_geometry.has_value()) {
++            return;
++        }
++        auto &animations_struct = workload.structs[struct_index];
++        auto &r = *reinterpret_cast<struct_little *>(animations_struct.data.data() + offset);
++
++        auto frame_data_struct = animations_struct.resolve_pointer(&r.frame_data.pointer);
++        if(!frame_data_struct.has_value()) {
++            return; // no frame data
++        }
++        auto &frame_data = workload.structs[*frame_data_struct];
++        frame_data.external = true;
++        frame_data.unsafe_to_dedupe = true;
++        workload.psp_external_animation_structs.push_back(*frame_data_struct);
++        workload.psp_external_animation_count++;
++        workload.psp_external_animation_bytes += frame_data.data.size();
++        if(frame_data.data.size() > workload.psp_external_animation_largest) {
++            workload.psp_external_animation_largest = frame_data.data.size();
++        }
++    }
++
+     void ModelAnimationsAnimation::pre_compile(BuildWorkload &workload, std::size_t tag_index, std::size_t, std::size_t offset) {
+         auto animation_index = offset / sizeof(*this);
+ 
+@@ -287,6 +318,21 @@ namespace Invader::Parser {
+                 }
+                 this->frame_data = frame_data;
+             }
++
++            // PSP port: keyframe-compress it (psp_keyframes.cpp)
++            auto &tolerance = workload.get_build_parameters()->psp_animation_tolerance;
++            if(tolerance.has_value() && frame_data_size > 0) {
++                std::size_t before, after;
++                if(psp_keyframe_compress(*this, tolerance->first, tolerance->second, before, after)) {
++                    workload.psp_animation_bytes_before += before;
++                    workload.psp_animation_bytes_after += after;
++                    workload.psp_animations_compressed++;
++                }
++                else {
++                    workload.psp_animation_bytes_before += before;
++                    workload.psp_animation_bytes_after += before;
++                }
++            }
+         }
+     }
+ }
+diff --git a/src/tag/parser/compile/model_collision_geometry.cpp b/src/tag/parser/compile/model_collision_geometry.cpp
+index 1e8a7994..6e02db2f 100644
+--- a/src/tag/parser/compile/model_collision_geometry.cpp
++++ b/src/tag/parser/compile/model_collision_geometry.cpp
+@@ -191,3 +191,33 @@ namespace Invader::Parser {
+         }
+     }
+ }
++
++namespace Invader::Parser {
++    // PSP port: a collision BSP's edges, surfaces and bsp2d references at
++    // 16 bits (invader-build -G). Every campaign BSP's counts fit: edges to
++    // 57,375 (unsigned), vertices and surfaces to 28,751, planes to 19,123 and
++    // bsp2d nodes to 28,445 with the flag bit kept at bit 15; no index is
++    // ever NONE in those tables. bsp3d nodes (to 51,300, with a leaf flag)
++    // and the rest stay as they are. The game's structs match under HALO_PSP.
++    //   edge:            6 x u16 (was 6 x u32)
++    //   surface:         i16 plane (flag 0x8000), u16 first edge, u8 flags, i8 breakable, i16 material (was 12 bytes)
++    //   bsp2d reference: i16 plane (flag), i16 bsp2d node (flag) (was 8 bytes)
++    void ModelCollisionGeometryBSP::post_compile(BuildWorkload &workload, std::size_t, std::size_t struct_index, std::size_t offset) {
++        if(!workload.get_build_parameters()->psp_external_geometry.has_value()) {
++            return;
++        }
++        // Packing waits until every build-time reader of the collision BSP
++        // (the scenario's encounter placement among them) is done: the
++        // workload packs these just before the tag data is laid out
++        auto &s = workload.structs[struct_index];
++        auto &bsp = *reinterpret_cast<struct_little *>(s.data.data() + offset);
++        BuildWorkload::PSPCollisionBlocks blocks = {};
++        blocks.edges = bsp.edges.count ? s.resolve_pointer(&bsp.edges.pointer) : std::nullopt;
++        blocks.surfaces = bsp.surfaces.count ? s.resolve_pointer(&bsp.surfaces.pointer) : std::nullopt;
++        blocks.references = bsp.bsp2d_references.count ? s.resolve_pointer(&bsp.bsp2d_references.pointer) : std::nullopt;
++        blocks.edge_count = bsp.edges.count;
++        blocks.surface_count = bsp.surfaces.count;
++        blocks.reference_count = bsp.bsp2d_references.count;
++        workload.psp_collision_blocks.push_back(blocks);
++    }
++}
+diff --git a/src/tag/parser/compile/psp_keyframes.cpp b/src/tag/parser/compile/psp_keyframes.cpp
+new file mode 100644
+index 00000000..ee00f267
+--- /dev/null
++++ b/src/tag/parser/compile/psp_keyframes.cpp
+@@ -0,0 +1,377 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++// PSP port: re-encode an uncompressed animation in Halo's own keyframe
++// format (the one model_animations.c decodes: animation_get_keyframe_rotation
++// and friends), choosing keyframes greedily so that the engine's
++// interpolation (nlerp for rotations, linear for translations and scales)
++// stays within a tolerance of the original frames. Frame 0 is the default;
++// the last frame is always a keyframe; a node whose every frame is within
++// tolerance of frame 0 gets no keyframes at all.
++//
++// Compressed layout (offsets from the header's start; little-endian):
++//   header: 11 longs of offsets, then one unsigned long per node that has
++//           the rotation flag: (first keyframe index << 12) | keyframe count
++//   rotation keyframe frame indices (u16, all rotated nodes' concatenated)
++//   default rotations (6-byte quaternion per node, every node)
++//   rotation keyframes (6-byte quaternions, concatenated)
++//   translation node headers (u32 per node with the translation flag)
++//   translation keyframe frame indices (u16)
++//   default translations (3 floats per node, every node)
++//   translation keyframes (3 floats each)
++//   scale node headers, scale keyframe frame indices, default scales, scale keyframes
++
++#include <invader/tag/parser/parser.hpp>
++#include <invader/build/build_workload.hpp>
++#include <cmath>
++#include <cstring>
++#include <vector>
++
++namespace Invader::Parser {
++    bool read_bit_from_bitfield(std::size_t offset, std::uint32_t *fields) noexcept;
++
++    namespace {
++        struct Quat { float i, j, k, w; };
++
++        constexpr float COMPONENT_MAXIMUM = 32767.0f;
++
++        Quat decode_8byte(const std::int16_t *v) {
++            return Quat { v[0] / COMPONENT_MAXIMUM, v[1] / COMPONENT_MAXIMUM, v[2] / COMPONENT_MAXIMUM, v[3] / COMPONENT_MAXIMUM };
++        }
++
++        // quaternion_compress_6byte / quaternion_decompress_6byte, as the engine has them
++        void encode_6byte(const Quat &q, std::uint16_t *words) {
++            long j = static_cast<long>(q.j * COMPONENT_MAXIMUM);
++            long k = static_cast<long>(q.k * COMPONENT_MAXIMUM);
++            long w = static_cast<long>(q.w * COMPONENT_MAXIMUM);
++            long i = static_cast<long>(q.i * COMPONENT_MAXIMUM);
++            words[0] = static_cast<std::uint16_t>((i & 0xFFF0) | (static_cast<std::uint16_t>(j) >> 12));
++            words[1] = static_cast<std::uint16_t>(((j & 0xFFF0) << 4) | ((static_cast<std::uint16_t>(k) >> 8) & 0x00FF));
++            words[2] = static_cast<std::uint16_t>(((k & 0x00F0) << 8) | (static_cast<std::uint16_t>(w) >> 4));
++        }
++
++        Quat decode_6byte(const std::uint16_t *words) {
++            std::uint16_t word0 = words[0], word1 = words[1], word2 = words[2];
++            std::int16_t i = static_cast<std::int16_t>((word0 >> 12) | (word0 & 0xFFF0));
++            std::int16_t j = static_cast<std::int16_t>(((word1 >> 4) & 0x0FF0) | (word0 & 0x000F) | (word0 << 12));
++            std::int16_t k = static_cast<std::int16_t>(((((word2 >> 4) & 0x0F00) | (word1 & 0x00F0)) >> 4) | (word1 << 8));
++            std::int16_t w = static_cast<std::int16_t>(((word2 >> 8) & 0x000F) | (word2 << 4));
++            return Quat { i / COMPONENT_MAXIMUM, j / COMPONENT_MAXIMUM, k / COMPONENT_MAXIMUM, w / COMPONENT_MAXIMUM };
++        }
++
++        Quat normalize(Quat q) {
++            float n = std::sqrt(q.i * q.i + q.j * q.j + q.k * q.k + q.w * q.w);
++            if(n > 0.0f) { q.i /= n; q.j /= n; q.k /= n; q.w /= n; }
++            return q;
++        }
++
++        // quaternions_interpolate_and_normalize: nlerp with the sign flip
++        Quat nlerp(const Quat &a, const Quat &b, float t) {
++            float v = 1.0f - t;
++            if(a.i * b.i + a.j * b.j + a.k * b.k + a.w * b.w < 0.0f) {
++                t = -t;
++            }
++            return normalize(Quat { a.i * v + b.i * t, a.j * v + b.j * t, a.k * v + b.k * t, a.w * v + b.w * t });
++        }
++
++        // the angle between two rotations, in degrees
++        double angle_between(const Quat &a0, const Quat &b0) {
++            Quat a = normalize(a0), b = normalize(b0);
++            double dot = std::fabs(static_cast<double>(a.i) * b.i + static_cast<double>(a.j) * b.j + static_cast<double>(a.k) * b.k + static_cast<double>(a.w) * b.w);
++            if(dot > 1.0) dot = 1.0;
++            return 2.0 * std::acos(dot) * 180.0 / 3.14159265358979323846;
++        }
++
++        // the value the engine would produce for frame f between keyframes at
++        // frames ka and kb holding (quantized) qa and qb
++        Quat engine_rotation(const Quat &qa, const Quat &qb, int ka, int kb, int f) {
++            float fraction = static_cast<float>(f - ka) / static_cast<float>(kb - ka);
++            return nlerp(qa, qb, fraction);
++        }
++
++        struct NodeKeys {
++            std::vector<std::uint16_t> frames; // keyframe frame indices (> 0, last = frame_count - 1); empty: constant
++        };
++
++        // greedy: from anchor a, extend b while every frame strictly between
++        // is within tolerance of the engine's interpolation between the two
++        // (quantized) keyframes
++        template <typename Value, typename Interp, typename Err>
++        NodeKeys choose_keys(const std::vector<Value> &frames, Interp interp, Err err, double tol) {
++            NodeKeys keys;
++            int F = static_cast<int>(frames.size());
++            // constant within tolerance of frame 0: no keyframes
++            bool constant = true;
++            for(int f = 1; f < F; f++) {
++                if(err(frames[0], frames[f]) > tol) { constant = false; break; }
++            }
++            if(constant) {
++                return keys;
++            }
++            int a = 0;
++            while(a < F - 1) {
++                int best = a + 1;
++                for(int b = a + 2; b < F; b++) {
++                    bool ok = true;
++                    for(int f = a + 1; f < b && ok; f++) {
++                        ok = err(interp(frames[a], frames[b], a, b, f), frames[f]) <= tol;
++                    }
++                    if(!ok) break;
++                    best = b;
++                }
++                keys.frames.push_back(static_cast<std::uint16_t>(best));
++                a = best;
++            }
++            if(keys.frames.empty() || keys.frames.back() != F - 1) {
++                keys.frames.push_back(static_cast<std::uint16_t>(F - 1));
++            }
++            return keys;
++        }
++
++        void append(std::vector<std::byte> &out, const void *data, std::size_t size) {
++            const auto *b = reinterpret_cast<const std::byte *>(data);
++            out.insert(out.end(), b, b + size);
++        }
++        void pad4(std::vector<std::byte> &out) {
++            while(out.size() % 4) out.push_back(std::byte());
++        }
++    }
++
++    // Returns true and replaces frame_data/default_data/flags when the
++    // animation was re-encoded. rotation_tolerance in degrees, translation
++    // tolerance in world units (also used for scale, as a fraction).
++    bool psp_keyframe_compress(ModelAnimationsAnimation &animation, double rotation_tolerance, double translation_tolerance, std::size_t &bytes_before, std::size_t &bytes_after) {
++        const std::size_t frame_count = animation.frame_count;
++        const std::size_t node_count = animation.node_count;
++        bytes_before = animation.frame_data.size() + animation.default_data.size();
++        bytes_after = bytes_before;
++        if(frame_count < 6 || node_count == 0 || node_count > 64 || animation.frame_data.empty()) {
++            return false;
++        }
++        if(animation.type == HEK::AnimationType::ANIMATION_TYPE_OVERLAY) {
++            return false; // overlay frames are not a time sequence (aiming screens are grids)
++        }
++        if(animation.flags & HEK::ModelAnimationsAnimationFlagsFlag::MODEL_ANIMATIONS_ANIMATION_FLAGS_FLAG_COMPRESSED_DATA) {
++            return false;
++        }
++
++        // Per node: the full sequence of values, frame 0 first. Unflagged
++        // components come from the default data (one value for all frames).
++        std::vector<bool> rot_flag(node_count), trn_flag(node_count), scl_flag(node_count);
++        std::size_t frame_size = 0;
++        for(std::size_t n = 0; n < node_count; n++) {
++            rot_flag[n] = read_bit_from_bitfield(n, animation.node_rotation_flag_data);
++            trn_flag[n] = read_bit_from_bitfield(n, animation.node_transform_flag_data);
++            scl_flag[n] = read_bit_from_bitfield(n, animation.node_scale_flag_data);
++            frame_size += (rot_flag[n] ? 8 : 0) + (trn_flag[n] ? 12 : 0) + (scl_flag[n] ? 4 : 0);
++        }
++        if(animation.frame_data.size() < frame_size * frame_count) {
++            return false;
++        }
++        std::vector<std::vector<Quat>> rotations(node_count);
++        std::vector<std::vector<std::array<float, 3>>> translations(node_count);
++        std::vector<std::vector<float>> scales(node_count);
++        const std::byte *frame_bytes = animation.frame_data.data();
++        for(std::size_t f = 0; f < frame_count; f++) {
++            const std::byte *p = frame_bytes + f * frame_size;
++            for(std::size_t n = 0; n < node_count; n++) {
++                if(rot_flag[n]) {
++                    std::int16_t v[4];
++                    std::memcpy(v, p, 8);
++                    rotations[n].push_back(decode_8byte(v));
++                    p += 8;
++                }
++                if(trn_flag[n]) {
++                    std::array<float, 3> t;
++                    std::memcpy(t.data(), p, 12);
++                    translations[n].push_back(t);
++                    p += 12;
++                }
++                if(scl_flag[n]) {
++                    float s;
++                    std::memcpy(&s, p, 4);
++                    scales[n].push_back(s);
++                    p += 4;
++                }
++            }
++        }
++        // defaults for the unflagged components (interleaved per node)
++        std::vector<Quat> default_rotation(node_count, Quat { 0, 0, 0, 1 });
++        std::vector<std::array<float, 3>> default_translation(node_count, std::array<float, 3> { 0, 0, 0 });
++        std::vector<float> default_scale(node_count, 1.0f);
++        {
++            const std::byte *p = animation.default_data.data();
++            const std::byte *end = p + animation.default_data.size();
++            for(std::size_t n = 0; n < node_count; n++) {
++                if(!rot_flag[n]) {
++                    if(p + 8 > end) return false;
++                    std::int16_t v[4];
++                    std::memcpy(v, p, 8);
++                    default_rotation[n] = decode_8byte(v);
++                    p += 8;
++                }
++                if(!trn_flag[n]) {
++                    if(p + 12 > end) return false;
++                    std::memcpy(default_translation[n].data(), p, 12);
++                    p += 12;
++                }
++                if(!scl_flag[n]) {
++                    if(p + 4 > end) return false;
++                    std::memcpy(&default_scale[n], p, 4);
++                    p += 4;
++                }
++            }
++        }
++        for(std::size_t n = 0; n < node_count; n++) {
++            if(rot_flag[n]) default_rotation[n] = rotations[n][0];
++            if(trn_flag[n]) default_translation[n] = translations[n][0];
++            if(scl_flag[n]) default_scale[n] = scales[n][0];
++        }
++
++        // Choose keyframes. Rotations are compared as the engine will see
++        // them: both keyframes quantized to 6 bytes, nlerp between.
++        auto rot_interp = [](const Quat &a, const Quat &b, int ka, int kb, int f) {
++            std::uint16_t wa[3], wb[3];
++            encode_6byte(a, wa); encode_6byte(b, wb);
++            return engine_rotation(decode_6byte(wa), decode_6byte(wb), ka, kb, f);
++        };
++        auto rot_err = [](const Quat &a, const Quat &b) { return angle_between(a, b); };
++        auto trn_interp = [](const std::array<float, 3> &a, const std::array<float, 3> &b, int ka, int kb, int f) {
++            float t = static_cast<float>(f - ka) / static_cast<float>(kb - ka);
++            return std::array<float, 3> { a[0] * (1 - t) + b[0] * t, a[1] * (1 - t) + b[1] * t, a[2] * (1 - t) + b[2] * t };
++        };
++        auto trn_err = [](const std::array<float, 3> &a, const std::array<float, 3> &b) {
++            double e = 0;
++            for(int i = 0; i < 3; i++) e = std::max(e, std::fabs(static_cast<double>(a[i]) - b[i]));
++            return e;
++        };
++        auto scl_interp = [](float a, float b, int ka, int kb, int f) {
++            float t = static_cast<float>(f - ka) / static_cast<float>(kb - ka);
++            return a * (1 - t) + b * t;
++        };
++        auto scl_err = [](float a, float b) { return std::fabs(static_cast<double>(a) - b); };
++
++        std::vector<NodeKeys> rot_keys(node_count), trn_keys(node_count), scl_keys(node_count);
++        for(std::size_t n = 0; n < node_count; n++) {
++            if(rot_flag[n]) rot_keys[n] = choose_keys(rotations[n], rot_interp, rot_err, rotation_tolerance);
++            if(trn_flag[n]) trn_keys[n] = choose_keys(translations[n], trn_interp, trn_err, translation_tolerance);
++            if(scl_flag[n]) scl_keys[n] = choose_keys(scales[n], scl_interp, scl_err, translation_tolerance);
++        }
++
++        // Assemble. Header first (its size depends on the rotated node count).
++        std::size_t rotated = 0, translated = 0, scaled = 0;
++        for(std::size_t n = 0; n < node_count; n++) { rotated += rot_flag[n]; translated += trn_flag[n]; scaled += scl_flag[n]; }
++        std::vector<std::byte> out;
++        std::uint32_t header[11] = {};
++        out.resize(11 * 4 + rotated * 4);
++        // rotation node headers
++        {
++            std::uint32_t *rot_headers = reinterpret_cast<std::uint32_t *>(out.data() + 44);
++            std::uint32_t first = 0, r = 0;
++            for(std::size_t n = 0; n < node_count; n++) {
++                if(!rot_flag[n]) continue;
++                std::uint32_t count = static_cast<std::uint32_t>(rot_keys[n].frames.size());
++                if(count >= 4096) return false;
++                rot_headers[r++] = (first << 12) | count;
++                first += count;
++            }
++        }
++        // rotation keyframe frame indices
++        header[0] = static_cast<std::uint32_t>(out.size());
++        for(std::size_t n = 0; n < node_count; n++) {
++            if(!rot_flag[n]) continue;
++            append(out, rot_keys[n].frames.data(), rot_keys[n].frames.size() * 2);
++        }
++        // default rotations (every node)
++        header[1] = static_cast<std::uint32_t>(out.size());
++        for(std::size_t n = 0; n < node_count; n++) {
++            std::uint16_t w[3];
++            encode_6byte(default_rotation[n], w);
++            append(out, w, 6);
++        }
++        // rotation keyframes
++        header[2] = static_cast<std::uint32_t>(out.size());
++        for(std::size_t n = 0; n < node_count; n++) {
++            if(!rot_flag[n]) continue;
++            for(auto f : rot_keys[n].frames) {
++                std::uint16_t w[3];
++                encode_6byte(rotations[n][f], w);
++                append(out, w, 6);
++            }
++        }
++        // translation node headers
++        pad4(out);
++        header[3] = static_cast<std::uint32_t>(out.size());
++        {
++            std::uint32_t first = 0;
++            for(std::size_t n = 0; n < node_count; n++) {
++                if(!trn_flag[n]) continue;
++                std::uint32_t count = static_cast<std::uint32_t>(trn_keys[n].frames.size());
++                if(count >= 4096) return false;
++                std::uint32_t h = (first << 12) | count;
++                append(out, &h, 4);
++                first += count;
++            }
++        }
++        header[4] = static_cast<std::uint32_t>(out.size());
++        for(std::size_t n = 0; n < node_count; n++) {
++            if(!trn_flag[n]) continue;
++            append(out, trn_keys[n].frames.data(), trn_keys[n].frames.size() * 2);
++        }
++        pad4(out);
++        header[5] = static_cast<std::uint32_t>(out.size());
++        for(std::size_t n = 0; n < node_count; n++) {
++            append(out, default_translation[n].data(), 12);
++        }
++        header[6] = static_cast<std::uint32_t>(out.size());
++        for(std::size_t n = 0; n < node_count; n++) {
++            if(!trn_flag[n]) continue;
++            for(auto f : trn_keys[n].frames) {
++                append(out, translations[n][f].data(), 12);
++            }
++        }
++        // scales
++        pad4(out);
++        header[7] = static_cast<std::uint32_t>(out.size());
++        {
++            std::uint32_t first = 0;
++            for(std::size_t n = 0; n < node_count; n++) {
++                if(!scl_flag[n]) continue;
++                std::uint32_t count = static_cast<std::uint32_t>(scl_keys[n].frames.size());
++                if(count >= 4096) return false;
++                std::uint32_t h = (first << 12) | count;
++                append(out, &h, 4);
++                first += count;
++            }
++        }
++        header[8] = static_cast<std::uint32_t>(out.size());
++        for(std::size_t n = 0; n < node_count; n++) {
++            if(!scl_flag[n]) continue;
++            append(out, scl_keys[n].frames.data(), scl_keys[n].frames.size() * 2);
++        }
++        pad4(out);
++        header[9] = static_cast<std::uint32_t>(out.size());
++        for(std::size_t n = 0; n < node_count; n++) {
++            append(out, &default_scale[n], 4);
++        }
++        header[10] = static_cast<std::uint32_t>(out.size());
++        for(std::size_t n = 0; n < node_count; n++) {
++            if(!scl_flag[n]) continue;
++            for(auto f : scl_keys[n].frames) {
++                append(out, &scales[n][f], 4);
++            }
++        }
++        pad4(out);
++        std::memcpy(out.data(), header, sizeof(header));
++
++        if(out.size() >= bytes_before) {
++            return false; // no gain: keep it as it was
++        }
++        (void)scaled; (void)translated;
++        animation.frame_data = out;
++        animation.default_data.clear();
++        animation.flags = static_cast<HEK::ModelAnimationsAnimationFlags>(animation.flags | HEK::ModelAnimationsAnimationFlagsFlag::MODEL_ANIMATIONS_ANIMATION_FLAGS_FLAG_COMPRESSED_DATA);
++        animation.offset_to_compressed_data = 0;
++        bytes_after = out.size();
++        return true;
++    }
++}
+diff --git a/src/tag/parser/compile/scenario/pre_compile.cpp b/src/tag/parser/compile/scenario/pre_compile.cpp
+index 47685660..afc82405 100644
+--- a/src/tag/parser/compile/scenario/pre_compile.cpp
++++ b/src/tag/parser/compile/scenario/pre_compile.cpp
+@@ -135,7 +135,57 @@ namespace Invader::Parser {
+         RIAT::CompilerScriptResult result;
+         try {
+             for(auto &source : source_files) {
+-                instance.read_script_data(reinterpret_cast<const std::uint8_t *>(source.source.data()), source.source.size(), (std::string(source.name.string) + ".hsc").c_str());
++                // PSP port: Bungie's script sources are Windows-1252, and a few
++                // campaign scenarios (c10, c40, d20) have an ellipsis or a curly
++                // apostrophe inside debug print strings, which RIAT refuses as
++                // invalid UTF-8. A source that isn't valid UTF-8 gets those bytes
++                // as plain ASCII ("..." and ' ; any other one as ?).
++                const auto *bytes = reinterpret_cast<const std::uint8_t *>(source.source.data());
++                std::size_t size = source.source.size();
++                bool valid_utf8 = true;
++                for(std::size_t i = 0; i < size && valid_utf8;) {
++                    std::uint8_t c = bytes[i];
++                    std::size_t extra = c < 0x80 ? 0 : (c & 0xE0) == 0xC0 ? 1 : (c & 0xF0) == 0xE0 ? 2 : (c & 0xF8) == 0xF0 ? 3 : 4;
++                    if(extra == 4 || i + extra >= size + (extra ? 0 : 1)) {
++                        valid_utf8 = extra == 0;
++                        break;
++                    }
++                    for(std::size_t k = 1; k <= extra; k++) {
++                        if((bytes[i + k] & 0xC0) != 0x80) {
++                            valid_utf8 = false;
++                        }
++                    }
++                    i += extra + 1;
++                }
++                std::vector<std::uint8_t> ascii;
++                if(!valid_utf8) {
++                    std::size_t replaced = 0;
++                    ascii.reserve(size + 64);
++                    for(std::size_t i = 0; i < size; i++) {
++                        std::uint8_t c = bytes[i];
++                        if(c < 0x80) {
++                            ascii.push_back(c);
++                            continue;
++                        }
++                        replaced++;
++                        if(c == 0x85) {
++                            ascii.insert(ascii.end(), {'.', '.', '.'});
++                        }
++                        else if(c == 0x91 || c == 0x92 || c == 0x93 || c == 0x94) {
++                            ascii.push_back('\'');
++                        }
++                        else if(c == 0x96 || c == 0x97) {
++                            ascii.push_back('-');
++                        }
++                        else {
++                            ascii.push_back('?');
++                        }
++                    }
++                    eprintf_warn("PSP: %s.hsc isn't UTF-8 (Windows-1252); %zu bytes made ASCII", source.name.string, replaced);
++                    bytes = ascii.data();
++                    size = ascii.size();
++                }
++                instance.read_script_data(bytes, size, (std::string(source.name.string) + ".hsc").c_str());
+             }
+             result = instance.compile_scripts();
+         }
+@@ -913,6 +963,21 @@ namespace Invader::Parser {
+             throw;
+         }
+ 
++        // PSP port (-Y): the node table holds the nodes in use plus a spare
++        // share, not the engine's maximum (b30: 4,557 of 19,001 nodes, so
++        // 290 KB of the tag window held empty nodes). The port's hs_allocate
++        // takes a table of any size that agrees with its own header
++        if(build_parameters.psp_script_node_spare.has_value() && scenario.script_syntax_data.size() >= sizeof(ScenarioScriptNodeTable::struct_big)) {
++            auto &table = *reinterpret_cast<ScenarioScriptNodeTable::struct_big *>(scenario.script_syntax_data.data());
++            std::size_t element_size = table.element_size;
++            std::size_t maximum = std::min<std::size_t>(table.maximum_count, static_cast<std::size_t>(table.size) + *build_parameters.psp_script_node_spare);
++            table.maximum_count = static_cast<std::uint16_t>(maximum);
++            scenario.script_syntax_data.resize(sizeof(ScenarioScriptNodeTable::struct_big) + maximum * element_size);
++            if(workload.get_build_parameters()->verbosity > BuildWorkload::BuildParameters::BuildVerbosity::BUILD_VERBOSITY_QUIET) {
++                oprintf("Script nodes: %zu in use, table sized for %zu\n", static_cast<std::size_t>(table.size), maximum);
++            }
++        }
++
+         // Check for stubs and warn
+         for(auto &script : scenario.scripts) {
+             if(script.script_type == HEK::ScenarioScriptType::SCENARIO_SCRIPT_TYPE_STUB) {
+diff --git a/src/tag/parser/compile/scenario_structure_bsp.cpp b/src/tag/parser/compile/scenario_structure_bsp.cpp
+index 8f3b6248..dd7cab7c 100644
+--- a/src/tag/parser/compile/scenario_structure_bsp.cpp
++++ b/src/tag/parser/compile/scenario_structure_bsp.cpp
+@@ -7,12 +7,31 @@
+ #include <invader/tag/parser/compile/bitmap.hpp>
+ #include <invader/tag/parser/compile/shader.hpp>
+ #include <cassert>
++#include <cstring>
++#include <cmath>
+ #include <map>
+ #include <utility>
+ 
+ namespace Invader::Parser {
+     void ScenarioStructureBSP::pre_compile(BuildWorkload &workload, std::size_t tag_index, std::size_t, std::size_t) {
+         this->runtime_decals.clear(); // delete these in case this tag was extracted improperly
++
++        // PSP port (-D): the detail objects (grass) left out; the port never
++        // draws them (structure_render_detail_objects returns at once) and
++        // nothing else reads them
++        if(workload.get_build_parameters()->psp_no_detail_objects && !this->detail_objects.empty()) {
++            std::size_t bytes = 0;
++            for(auto &d : this->detail_objects) {
++                bytes += sizeof(Parser::ScenarioStructureBSPDetailObjectData::struct_little);
++                bytes += d.cells.size() * sizeof(Parser::ScenarioStructureBSPGlobalDetailObjectCell::struct_little);
++                bytes += d.instances.size() * sizeof(Parser::ScenarioStructureBSPGlobalDetailObject::struct_little);
++                bytes += d.counts.size() * sizeof(Parser::ScenarioStructureBSPGlobalDetailObjectCount::struct_little);
++                bytes += d.z_reference_vectors.size() * sizeof(Parser::ScenarioStructureBSPGlobalZReferenceVector::struct_little);
++            }
++            workload.psp_detail_object_bsps++;
++            workload.psp_detail_object_bytes += bytes;
++            this->detail_objects.clear();
++        }
+         
+         auto engine = workload.get_build_parameters()->details.build_cache_file_engine;
+         auto cea = engine == HEK::CacheFileEngine::CACHE_FILE_MCC_CEA;
+@@ -596,6 +615,9 @@ namespace Invader::Parser {
+     void set_up_xbox_cache_bsp_data(BuildWorkload &workload, std::size_t bsp_header_struct_index, std::size_t bsp_struct_index, std::size_t bsp) {
+         // Add two structs
+         auto struct_count = workload.structs.size();
++        // PSP port: one more struct per material may be added below, and the
++        // references taken here must survive it (no reallocation)
++        workload.structs.reserve(struct_count + 2 + 2048);
+         workload.structs.resize(struct_count + 2);
+         auto rendered_vertices_struct_index = struct_count;
+         auto lightmap_vertices_struct_index = struct_count + 1;
+@@ -671,6 +693,68 @@ namespace Invader::Parser {
+             auto &lm = lightmap_pointers[m];
+             auto &mat = lightmap_materials[m];
+             auto cv = mat.material_struct->resolve_pointer(&mat.material->compressed_vertices.pointer).value();
++
++            // PSP port: the material's vertex data leaves the map for the
++            // geometry file; the renderer reads it through a cache there.
++            // The game's own readers (the per-surface frustum test, the
++            // surface under a point, object lighting) want positions, so a
++            // 12-byte-a-vertex copy of those stays in the map, and the
++            // material's compressed vertex data pointer is turned to it.
++            if(workload.get_build_parameters()->psp_external_geometry.has_value()) {
++                if(material_count > 2048) {
++                    REPORT_ERROR_PRINTF(workload, ERROR_TYPE_FATAL_ERROR, std::nullopt, "PSP geometry: more than 2048 materials in a BSP");
++                    throw InvalidTagDataException();
++                }
++                auto &cv_struct = workload.structs[cv];
++                cv_struct.external = true;
++                std::size_t rendered = mat.material->rendered_vertices_count;
++                std::size_t positions_struct_index = workload.structs.size();
++                auto &positions_struct = workload.structs.emplace_back();
++                positions_struct.bsp = bsp;
++                positions_struct.unsafe_to_dedupe = true;
++                // 6 bytes a vertex: three int16, relative to the material's
++                // centroid, times a scale kept in the (unused on Xbox)
++                // uncompressed vertices' size field
++                positions_struct.data.resize(rendered * 6);
++                auto &cv_struct_again = workload.structs[cv]; // emplace_back may have moved
++                auto *material_again = lightmap_materials[m].material;
++                float centroid[3] = { material_again->centroid.x, material_again->centroid.y, material_again->centroid.z };
++                float largest = 0.0f;
++                for(std::size_t v = 0; v < rendered; v++) {
++                    float p[3];
++                    std::memcpy(p, cv_struct_again.data.data() + v * 32, 12);
++                    for(int k = 0; k < 3; k++) {
++                        float d = std::fabs(p[k] - centroid[k]);
++                        if(d > largest) largest = d;
++                    }
++                }
++                float scale = largest > 0.0f ? largest / 32767.0f : 1.0f;
++                for(std::size_t v = 0; v < rendered; v++) {
++                    float p[3];
++                    std::int16_t q[3];
++                    std::memcpy(p, cv_struct_again.data.data() + v * 32, 12);
++                    for(int k = 0; k < 3; k++) {
++                        float r = (p[k] - centroid[k]) / scale;
++                        long i = static_cast<long>(std::lround(r));
++                        if(i > 32767) i = 32767;
++                        if(i < -32767) i = -32767;
++                        q[k] = static_cast<std::int16_t>(i);
++                    }
++                    std::memcpy(positions_struct.data.data() + v * 6, q, 6);
++                }
++                auto &material_struct_again = *lightmap_materials[m].material_struct;
++                std::size_t cv_pointer_offset = reinterpret_cast<const std::byte *>(&material_again->compressed_vertices.pointer) - material_struct_again.data.data();
++                for(auto &ptr : material_struct_again.pointers) {
++                    if(ptr.offset == cv_pointer_offset) {
++                        ptr.struct_index = positions_struct_index;
++                        ptr.struct_data_offset = 0;
++                    }
++                }
++                material_again->compressed_vertices.size = static_cast<std::uint32_t>(rendered * 6);
++                std::uint32_t scale_bits;
++                std::memcpy(&scale_bits, &scale, 4);
++                material_again->uncompressed_vertices.size = scale_bits;
++            }
+             
+             auto &rvp = rendered_vertices_struct.pointers.emplace_back();
+             rvp.limit_to_32_bits = true;
+@@ -695,5 +779,81 @@ namespace Invader::Parser {
+             lmp_from_material.struct_index = lightmap_vertices_struct_index;
+             lmp_from_material.struct_data_offset = reinterpret_cast<std::byte *>(&lm) - reinterpret_cast<std::byte *>(lightmap_pointers);
+         }
++
++        // PSP port: the per-surface visibility structures at 16 bits (the
++        // game's two readers are patched to match, keyed by the map's layout):
++        // leaf surface references {surface, bsp3d node} 8 -> 4 bytes (node
++        // 0xFFFF for none), and the clusters' and subclusters' surface index
++        // lists 4 -> 2 bytes. Counts in every Xbox map are under 65,535.
++        if(workload.get_build_parameters()->psp_external_geometry.has_value()) {
++            auto &bsp_struct_again = workload.structs[bsp_struct_index];
++            auto &bsp_data_again = *reinterpret_cast<Parser::ScenarioStructureBSP::struct_little *>(bsp_struct_again.data.data());
++            std::size_t leaf_surface_count = bsp_data_again.leaf_surfaces.count;
++            if(leaf_surface_count > 0) {
++                auto ls = bsp_struct_again.resolve_pointer(&bsp_data_again.leaf_surfaces.pointer);
++                if(ls.has_value()) {
++                    auto &ls_struct = workload.structs[*ls];
++                    std::vector<std::byte> packed(leaf_surface_count * 4);
++                    for(std::size_t i = 0; i < leaf_surface_count; i++) {
++                        std::int32_t surface, node;
++                        std::memcpy(&surface, ls_struct.data.data() + i * 8, 4);
++                        std::memcpy(&node, ls_struct.data.data() + i * 8 + 4, 4);
++                        if(surface < 0 || surface > 0xFFFE || node > 0xFFFE || node < -1) {
++                            REPORT_ERROR_PRINTF(workload, ERROR_TYPE_FATAL_ERROR, std::nullopt, "PSP geometry: a leaf surface reference does not fit 16 bits (%d, %d)", surface, node);
++                            throw InvalidTagDataException();
++                        }
++                        std::uint16_t s16 = static_cast<std::uint16_t>(surface), n16 = node < 0 ? 0xFFFF : static_cast<std::uint16_t>(node);
++                        std::memcpy(packed.data() + i * 4, &s16, 2);
++                        std::memcpy(packed.data() + i * 4 + 2, &n16, 2);
++                    }
++                    ls_struct.data = packed;
++                    ls_struct.unsafe_to_dedupe = true;
++                }
++            }
++            auto pack_indices = [&workload](BuildWorkload::BuildWorkloadStruct &owner, std::size_t pointer_offset, std::size_t count) {
++                if(count == 0) return;
++                auto idx = owner.resolve_pointer(pointer_offset);
++                if(!idx.has_value()) return;
++                auto &st = workload.structs[*idx];
++                if(st.data.size() < count * 4) return;
++                std::vector<std::byte> packed(count * 2);
++                for(std::size_t i = 0; i < count; i++) {
++                    std::int32_t v;
++                    std::memcpy(&v, st.data.data() + i * 4, 4);
++                    if(v < 0 || v > 0xFFFF) {
++                        REPORT_ERROR_PRINTF(workload, ERROR_TYPE_FATAL_ERROR, std::nullopt, "PSP geometry: a surface index does not fit 16 bits (%d)", v);
++                        throw InvalidTagDataException();
++                    }
++                    std::uint16_t v16 = static_cast<std::uint16_t>(v);
++                    std::memcpy(packed.data() + i * 2, &v16, 2);
++                }
++                st.data = packed;
++                st.unsafe_to_dedupe = true;
++            };
++            std::size_t cluster_count = bsp_data_again.clusters.count;
++            if(cluster_count > 0) {
++                auto cl = bsp_struct_again.resolve_pointer(&bsp_data_again.clusters.pointer);
++                if(cl.has_value()) {
++                    auto &clusters_struct = workload.structs[*cl];
++                    for(std::size_t c = 0; c < cluster_count; c++) {
++                        auto *cluster = reinterpret_cast<Parser::ScenarioStructureBSPCluster::struct_little *>(clusters_struct.data.data() + c * sizeof(Parser::ScenarioStructureBSPCluster::struct_little));
++                        std::size_t base = c * sizeof(Parser::ScenarioStructureBSPCluster::struct_little);
++                        pack_indices(clusters_struct, base + (reinterpret_cast<const std::byte *>(&cluster->surface_indices.pointer) - reinterpret_cast<const std::byte *>(cluster)), cluster->surface_indices.count);
++                        std::size_t subcluster_count = cluster->subclusters.count;
++                        if(subcluster_count > 0) {
++                            auto sc = clusters_struct.resolve_pointer(base + (reinterpret_cast<const std::byte *>(&cluster->subclusters.pointer) - reinterpret_cast<const std::byte *>(cluster)));
++                            if(sc.has_value()) {
++                                auto &subclusters_struct = workload.structs[*sc];
++                                for(std::size_t k = 0; k < subcluster_count; k++) {
++                                    auto *subcluster = reinterpret_cast<Parser::ScenarioStructureBSPSubcluster::struct_little *>(subclusters_struct.data.data() + k * sizeof(Parser::ScenarioStructureBSPSubcluster::struct_little));
++                                    std::size_t sbase = k * sizeof(Parser::ScenarioStructureBSPSubcluster::struct_little);
++                                    pack_indices(subclusters_struct, sbase + (reinterpret_cast<const std::byte *>(&subcluster->surface_indices.pointer) - reinterpret_cast<const std::byte *>(subcluster)), subcluster->surface_indices.count);
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
+     }
+ }

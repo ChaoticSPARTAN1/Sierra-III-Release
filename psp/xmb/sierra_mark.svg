@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-4 -4 608 168" width="608" height="168" role="img" aria-label="Sierra-III PSP">
+  <!-- The Sierra-III mark, the vector master for every use (XMB tile, wallpaper, README).
+       Lettering drawn on its own system: monoline, 45-degree chamfers, open ends cut "/",
+       two slashes through the back of the P's and R's bowls. PSP spans the III exactly.
+       The slate chrome and amber are shared with the game title on the wallpaper.
+       Drop shadows are added by whatever renders it, so the master stays flat. -->
+  <defs>
+    <!-- the horizon sits at a third of the letter height, clear of the middle bars -->
+    <linearGradient id="slate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#eaeff2"/>
+      <stop offset="0.33" stop-color="#b2bcc5"/>
+      <stop offset="0.39" stop-color="#68737d"/>
+      <stop offset="1" stop-color="#abb5bd"/>
+    </linearGradient>
+    <linearGradient id="amber" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#c29b63"/>
+      <stop offset="1" stop-color="#a06e26"/>
+    </linearGradient>
+  </defs>
+  <path id="sierra-iii" fill="url(#slate)" stroke="#06080a" stroke-width="5.9" stroke-linejoin="miter" paint-order="stroke" d="M257.6 1.3L212.7 1.3L230.1 18.7L248.4 18.7L257.0 27.3L257.0 29.1L271.2 14.9Z M341.6 1.3L296.7 1.3L314.1 18.7L332.4 18.7L341.0 27.3L341.0 29.1L355.2 14.9Z M18.7 81.3L1.3 98.7L48.6 98.7L68.0 79.3L68.0 62.4L46.9 41.3L28.6 41.3L20.0 32.7L20.0 27.3L28.6 18.7L49.3 18.7L66.7 1.3L19.4 1.3L0.0 20.7L0.0 37.6L21.1 58.7L39.4 58.7L48.0 67.3L48.0 72.7L39.4 81.3Z M105.0 80.0L105.0 0.0L85.0 20.0L85.0 100.0Z M145.4 1.3L126.0 20.7L126.0 79.3L145.4 98.7L175.3 98.7L192.7 81.3L154.6 81.3L146.0 72.7L146.0 58.7L165.3 58.7L182.7 41.3L146.0 41.3L146.0 27.3L154.6 18.7L175.3 18.7L192.7 1.3Z M277.0 39.3L277.0 30.9L256.4 51.5L252.2 47.3L277.0 22.4L277.0 20.7L275.4 19.2L256.4 38.2L254.0 35.8L248.4 41.3L229.0 41.3L229.0 40.0L209.0 60.0L209.0 100.0L229.0 80.0L229.0 58.7L248.4 58.7L257.0 67.3L257.0 100.0L277.0 80.0L277.0 60.7L266.3 50.0Z M498.0 20.0L498.0 100.0L518.0 80.0L518.0 0.0Z M539.0 100.0L559.0 80.0L559.0 0.0L539.0 20.0Z M580.0 20.0L580.0 100.0L600.0 80.0L600.0 0.0Z M374.0 100.0L394.0 80.0L394.0 66.7L422.0 66.7L422.0 85.6L429.2 92.8L442.0 80.0L442.0 20.7L422.6 1.3L393.4 1.3L374.0 20.7Z M422.0 49.3L394.0 49.3L394.0 27.3L402.6 18.7L413.4 18.7L422.0 27.3Z M361.0 30.9L340.4 51.5L336.2 47.3L361.0 22.4L361.0 20.7L359.4 19.2L340.4 38.2L338.0 35.8L332.4 41.3L313.0 41.3L313.0 40.0L293.0 60.0L293.0 100.0L313.0 80.0L313.0 58.7L332.4 58.7L341.0 67.3L341.0 100.0L361.0 80.0L361.0 60.7L350.3 50.0L361.0 39.3Z"/>
+  <path id="dash" fill="url(#amber)" stroke="#06080a" stroke-width="5.9" paint-order="stroke" d="M454.0 41.3L484.0 41.3L484.0 58.7L454.0 58.7Z"/>
+  <path id="psp" fill="url(#amber)" stroke="#06080a" stroke-width="5.9" paint-order="stroke" d="M506.8 127.2L506.8 124.2L515.3 124.2L519.0 127.9L519.0 129.9L525.8 123.1L519.3 116.6L498.0 116.6L498.0 118.4Z M579.0 127.2L579.0 124.2L587.5 124.2L591.2 127.9L591.2 129.9L598.0 123.1L591.5 116.6L570.2 116.6L570.2 118.4Z M550.3 141.7L554.0 145.4L554.0 147.8L550.3 151.6L541.2 151.6L533.6 159.2L554.3 159.2L562.8 150.7L562.8 143.3L553.5 134.1L545.5 134.1L541.8 130.3L541.8 127.9L545.5 124.2L554.6 124.2L562.2 116.6L541.5 116.6L533.0 125.1L533.0 132.4L542.3 141.7Z M527.8 131.9L518.7 140.9L516.9 139.0L527.8 128.2L527.8 125.1L527.7 125.0L519.0 133.6L519.0 133.8L515.3 137.6L506.8 137.6L506.8 137.0L498.0 145.8L498.0 159.8L506.8 151.0L506.8 145.2L519.3 145.2L527.8 136.7Z M600.0 131.9L591.0 140.9L589.1 139.0L600.0 128.2L600.0 125.1L599.9 125.0L591.2 133.6L591.2 133.8L587.5 137.6L579.0 137.6L579.0 137.0L570.2 145.8L570.2 159.8L579.0 151.0L579.0 145.2L591.5 145.2L600.0 136.7Z"/>
+</svg>
