@@ -1,6 +1,6 @@
 # Sierra-III
 
-Native PlayStation Portable port of Halo: Combat Evolved, built for the original PSP-1000 (32 MB RAM, 333 MHz). Based on the community decompilation. Bring your own game files: no game data is included.
+Native PlayStation Portable port of Halo: Combat Evolved, built for the original PSP-1000 (32 MB RAM, 333 MHz). Based on Chupathingy by Milenko, also based on OpenCE. Bring your own game files: no game data is included.
 
 *Sierra-III ("Sierra Three") is the port's codename.*
 
@@ -12,7 +12,7 @@ The target is a steady 30 ticks a second at 30 fps everywhere in the campaign. M
 
 ## Get it running
 
-You need a PSP with custom firmware (ARK-4) and a Memory Stick with 3.5 GB free; your own disc image of Halo for the original Xbox (NTSC, version 01.10.12.2276 only, for now); and a Windows 10 or 11 PC, or a Linux PC with glibc 2.39 or later, to bake the maps on.
+You need a PSP with custom firmware (ARK-4) and a Memory Stick with 3.5 GB free; your own disc image of Halo for the original Xbox (Tested against NTSC version 01.10.12.2276); and a Windows 10 or 11 PC, or a Linux PC with glibc 2.39 or later, to bake the maps on.
 
 1. **Download** from the [releases page](https://github.com/Sheepdog-01/Sierra-III-Release/releases) the game zip (`halo_psp_b143.zip`) and the bake tool for your PC.
 2. **Unpack the bake tool**, then put your disc image and the game zip, unopened, in the two folders it names.
@@ -28,9 +28,9 @@ You need a PSP with custom firmware (ARK-4) and a Memory Stick with 3.5 GB free;
 
 Sierra-III is written with an AI model, Claude, and every change says so. The division of work is fixed:
 
-- **The maintainer decides what to build** and in what order, and every change to how the game looks or plays is the maintainer's call, made after seeing both sides.
+- **The maintainer, Sheepdog-01 decides what to build** and in what order, and every change to how the game looks or plays is the maintainer's call, made after seeing both sides.
 - **Claude writes the code**, and each change carries its evidence: why it's there, what it was measured against, and whether the figure came from the PSP, the emulator, the code or inference (`[M]`, `[E]`, `[D]`, `[U]` in the docs).
-- **Every build is tested on a real PSP-1000** before the next one is made, and speed-ups that claim to leave the game unchanged are checked tick by tick against the game's state in an emulator first.
+- **Every build is tested on a real PSP** before the next one is made, and speed-ups that claim to leave the game unchanged are checked tick by tick against the game's state in an emulator first.
 - **The maintainer reviews every build's changes** through a walk-through of what changed and why.
 
 The decompilation this port is built on, and ChupathingyCE, were also made with heavy use of AI tools; ChupathingyCE's README says how it uses them, and Sierra-III follows the same principle: a person decides, reviews, tests and answers for every change.
