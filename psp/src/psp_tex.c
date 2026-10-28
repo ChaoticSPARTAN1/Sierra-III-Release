@@ -97,6 +97,7 @@ low frame rates the budget was spent before the HUD's turn. 1: pinned.
 "hudpinoff": as before */
 static unsigned char *hud_pinned = NULL;
 static int hud_pin_on = -1;
+static void hud_pin_list_forget(void); /* hudpinme, below */
 static unsigned long hud_misses = 0, hud_reads_past_budget = 0, hud_untextured = 0;
 int psp_tex_screen_pass = 0; /* psp_ge.c: set while the screen-space draws are made */
 /* build 44: binds per entry since the last report, to see which textures
@@ -109,15 +110,18 @@ the counts follow how the map is played now); with keep.txt's "vramranked",
 the next run's VRAM set is chosen from them instead of by size */
 static unsigned int *bind_totals = NULL;
 static char map_name[64];
-/* per entry: its average colour once worked out (psp_tex_average) */
-static unsigned int *averages = NULL;
+/* per entry: its average colour (ABGR), from the pack's 'TAV1' table
+(texpack.py, runtime_reads: worked out as the runtime sampled it until b144,
+so nothing on the Media Engine reads a texture for it). averages holds the
+ones asked for while the texture was resident, so psp_tex_average_known
+answers after it has left; the ME's work writes it, on lines of its own */
+static unsigned int *averages = NULL, *baked_averages = NULL;
 static int averages_count = 0;
-/* "avgold": the averages' table allocated by the first psp_tex_average, as
-before, on whichever CPU asks: on the Media Engine (the replay's flashlight
-pass) that ran newlib's malloc there, beside the main CPU's own and outside
-its lock. "avgmerealloc" (the proof of it): the ME's work frees and
-allocates the table again at each average it asks for */
-static PSP_MAIN_SIDE int avg_old = 0, avg_me_realloc = 0;
+/* directory flags (texpack.py): the change mask's CLUT ends the texture's
+data; the CPU reads its palette (the meters), so it's kept in main RAM, which
+the Media Engine can reach */
+#define CHANGE_MASK 8
+#define CPU_READS 16
 /* the light gels' six face colours (psp_tex_gel_faces) */
 #define GEL_FACES_MARK 0xFACE
 #define GEL_FACES_KEPT 16
@@ -128,6 +132,22 @@ static struct
 	float faces[18];
 } gel_faces_kept[GEL_FACES_KEPT];
 static int gel_faces_next = 0;
+/* the light gels' kept cubes (psp_tex_gel_cube): a CLUT8 patch whose entry
+255 is GEL_CUBE_MARK holds the six faces stacked, GEL_CUBE_SIDE a side
+(texpack.py, gel_cube). The light pass samples one at every lit vertex, so
+each is copied out of the uncached texture once, as colours, and kept by key */
+#define GEL_CUBE_MARK 0xC0BE
+#define GEL_CUBE_SIDE 16
+#define GEL_CUBE_TEXELS (6 * GEL_CUBE_SIDE * GEL_CUBE_SIDE)
+#define GEL_CUBES_KEPT 4
+struct gel_cube
+{
+	unsigned int key;
+	int known;
+	unsigned short texels[GEL_CUBE_TEXELS]; /* GU_PSM_5650 */
+};
+static struct gel_cube gel_cubes_kept[GEL_CUBES_KEPT];
+static int gel_cubes_next = 0;
 /* the see-through shaders' tints (texpack.py), pairs of (the shader's tag
 address, its tint ABGR) sorted by address. Bits of the address: 0, the tint
 is half the colour, for the GE's colour doubling; 1, the tint is added to the
@@ -415,10 +435,14 @@ void psp_tex_close(void)
 	free(resident_in);
 	free(hud_pinned);
 	hud_pinned = NULL;
+	hud_pin_list_forget();
 	free(averages);
 	averages = NULL;
 	averages_count = 0;
+	free(baked_averages);
+	baked_averages = NULL;
 	memset(gel_faces_kept, 0, sizeof(gel_faces_kept));
+	memset(gel_cubes_kept, 0, sizeof(gel_cubes_kept));
 	free(tints);
 	tints = NULL;
 	tint_count = 0;
@@ -833,7 +857,7 @@ static void preload(int ranked)
 		{
 			unsigned int size = (entries[order[k]].size + 63) & ~63u;
 
-			if (used + size <= vram && vram_pending_count < 512)
+			if (used + size <= vram && vram_pending_count < 512 && !(entries[order[k]].flags & CPU_READS))
 			{
 				used += size;
 				vram_pending[vram_pending_count++] = order[k];
@@ -1160,18 +1184,9 @@ void psp_tex_map_opened(const char *name)
 	resident_in = calloc(header[1], 1);
 	hud_pinned = calloc(header[1], 1);
 	bind_counts = line_calloc(header[1], sizeof(unsigned short));
-	/* the averages' table here, on the main CPU: the ME's work only fills it
-	(psp_tex_average), on lines of its own */
-	avg_old = psp_keep("avgold") != 0;
-	avg_me_realloc = psp_keep("avgmerealloc") != 0;
 	free(averages);
-	averages = NULL;
-	averages_count = 0;
-	if (!avg_old && !avg_me_realloc)
-	{
-		averages = line_calloc(header[1], sizeof(unsigned int));
-		averages_count = averages ? (int)header[1] : 0;
-	}
+	averages = line_calloc(header[1], sizeof(unsigned int));
+	averages_count = averages ? (int)header[1] : 0;
 	if (!ram_cache)
 		ram_cache_acquire();
 	if (!entries || !resident_at || !last_frame || !resident_in || sceIoRead(file, entries, header[2]) != (int)header[2])
@@ -1241,17 +1256,36 @@ void psp_tex_map_opened(const char *name)
 			}
 		}
 		if (tables == 3 && sceIoRead(file, table, sizeof(table)) == (int)sizeof(table) &&
-			table[0] == 0x31434E54 /* TNC1 */ && table[1] > 0 && table[1] <= 4096 &&
-			(composites = malloc(table[1] * 8)) != NULL)
+			table[0] == 0x31434E54 /* TNC1 */ && table[1] <= 4096)
 		{
-			if (sceIoRead(file, composites, table[1] * 8) == (int)(table[1] * 8))
-				composite_count = (int)table[1];
-			else
+			tables = 4;
+			if (table[1] > 0 && (composites = malloc(table[1] * 8)) != NULL)
 			{
-				free(composites);
-				composites = NULL;
+				if (sceIoRead(file, composites, table[1] * 8) == (int)(table[1] * 8))
+					composite_count = (int)table[1];
+				else
+				{
+					free(composites);
+					composites = NULL;
+					tables = 0;
+				}
 			}
+			else if (table[1] > 0)
+				tables = 0;
 		}
+		/* the averages ('TAV1', one a texture in directory order), since bake
+		format 2; a pack without them has no averages: models' reflections
+		stay out of their ambient and the flashlight's cone untinted */
+		if (tables == 4 && sceIoRead(file, table, sizeof(table)) == (int)sizeof(table) &&
+			table[0] == 0x31564154 /* TAV1 */ && table[1] == header[1] &&
+			(baked_averages = malloc(table[1] * 4)) != NULL &&
+			sceIoRead(file, baked_averages, table[1] * 4) != (int)(table[1] * 4))
+		{
+			free(baked_averages);
+			baked_averages = NULL;
+		}
+		if (!baked_averages)
+			platform_log("textures: no averages in this pack (baked before bake format 2): bake again with this build's tools");
 		platform_log("textures: see-through tints for %d shaders%s; drawn maps chosen by the bake for %d%s", tint_count,
 			tint_count ? "" : " (a pack baked before build 116: none)", drawn_map_count,
 			drawn_map_count ? (drawn_map_scale() ? " (drawnmapscale: the smallest scale's instead)" : "") :
@@ -1571,7 +1605,7 @@ static int load_into(int index, int only);
 
 static int load(int index)
 {
-	return load_into(index, -1);
+	return load_into(index, entries[index].flags & CPU_READS ? 1 : -1);
 }
 
 extern volatile int psp_ge_show_busy; /* psp_ge.c */
@@ -2218,13 +2252,80 @@ static void txc_frame_end(void)
 
 /* resident_only: 1 marks the texture only if it's resident; 2 (the census
 alone) notes a key a filter passed over */
+/* "hudpinme" (on by default; "hudpinmeold": as before): resident_only 3 is
+the HUD's and the motion sensor's records (psp_ge.c, GE_PRETOUCH_HUD). With
+the Media Engine replaying the frame (gemeon), the HUD's binds run on the ME,
+where the pin above is never set, and the HUD records come last, after the
+ceiling below has stopped marking: under a full texture cache the meters
+and the sensor were drawn untextured or not at all while the log's HUD line
+(main-CPU binds only) said none were missing (GROUNDTEX's test bakes,
+groundtex1/2: b30's HUD quads -10%, c20's nearly all). Here, on
+the main CPU as the record is written, they're pinned as a main-CPU bind
+pins them, read past the frame's budget, and marked past the ceiling (the
+HUD's set is small) */
+static PSP_MAIN_SIDE int hud_pin_me = -1;
+static PSP_MAIN_SIDE unsigned long hud_pretouched = 0, hud_pretouch_past_ceiling = 0, hud_pretouch_refused = 0;
+/* the pinned textures, so a frame's start reads back any the cache lost:
+there, before the frame's own records, last frame's textures may give way
+(hudpin1: under a full cache 2,337 of the HUD's loads found no room once
+the frame's own set filled both caches, and the meters still went) */
+#define HUD_PIN_LIST 96
+static PSP_MAIN_SIDE int hud_pin_list[HUD_PIN_LIST], hud_pin_count = 0;
+/* the frame each was last asked for: a texture refused room never gets a
+drawn frame (last_frame), so that can't say it's still wanted */
+static PSP_MAIN_SIDE unsigned int hud_pin_asked[HUD_PIN_LIST];
+static PSP_MAIN_SIDE unsigned long hud_frame_start_loads = 0, hud_frame_start_refused = 0;
+
+static void hud_pin_list_forget(void)
+{
+	hud_pin_count = 0;
+}
+
+/* the room the pins hold (the master: what the pin keeps from the rest) */
+static unsigned int hud_pin_kb(int resident)
+{
+	unsigned int bytes = 0;
+	int k;
+
+	for (k = 0; k < hud_pin_count && entries; k++)
+		if (!resident || resident_at[hud_pin_list[k]])
+			bytes += alignment(entries[hud_pin_list[k]].size);
+	return bytes / 1024;
+}
+
+/* the HUD's pinned textures the cache lost, read back at the frame's first
+record (psp_ge.c's pretouch has carried out any frame still in flight by
+then, so nothing it binds is evicted), before the frame's own set fills
+the caches and while last frame's textures can give way */
+static PSP_MAIN_SIDE unsigned int hud_readback_frame = ~0u;
+
+static void hud_read_back(void)
+{
+	int k;
+
+	hud_readback_frame = frame;
+	for (k = 0; k < hud_pin_count; k++)
+	{
+		int index = hud_pin_list[k];
+
+		if (resident_at[index] || hud_pin_asked[k] + RECENT_FRAMES <= frame)
+			continue;
+		if (load(index))
+			hud_frame_start_loads++;
+		else
+			hud_frame_start_refused++;
+	}
+}
+
 void psp_tex_pretouch(unsigned int key, int kind, int resident_only)
 {
-	int index;
+	int index, hud = 0;
 	unsigned int size, room;
 
 	if (!key || !entries || PSP_ME_WORK() || (unsigned int)kind >= PRETOUCH_KINDS)
 		return;
+	if (hud_pin_me > 0 && hud_readback_frame != frame)
+		hud_read_back();
 	if (pretouch_frame[kind] == frame && pretouch_key[kind] == key)
 		return;
 	index = find(key);
@@ -2232,6 +2333,17 @@ void psp_tex_pretouch(unsigned int key, int kind, int resident_only)
 		return;
 	pretouch_key[kind] = key;
 	pretouch_frame[kind] = frame;
+	if (resident_only == 3)
+	{
+		if (hud_pin_me < 0)
+			hud_pin_me = !psp_keep("hudpinmeold");
+		if (hud_pin_on < 0)
+			hud_pin_on = !psp_keep("hudpinoff");
+		hud = hud_pin_me > 0 && hud_pin_on > 0;
+		resident_only = 0;
+		if (hud)
+			hud_pretouched++;
+	}
 	/* (a texture touched only if resident and not resident isn't missed: the
 	ME binding it draws untextured and asks for it, as the replay always has,
 	touching nothing the main CPU writes) */
@@ -2245,13 +2357,29 @@ void psp_tex_pretouch(unsigned int key, int kind, int resident_only)
 		return;
 	}
 	pretouch_calls++;
+	if (hud && hud_pinned)
+	{
+		int k;
+
+		if (!hud_pinned[index] && hud_pin_count < HUD_PIN_LIST)
+			hud_pin_list[hud_pin_count++] = index;
+		hud_pinned[index] = 1;
+		for (k = 0; k < hud_pin_count; k++)
+			if (hud_pin_list[k] == index)
+			{
+				hud_pin_asked[k] = frame;
+				break;
+			}
+	}
 	if (resident_at[index] && last_frame[index] == frame)
 		return; /* marked already, by a bind or another kind */
 	size = alignment(entries[index].size);
 	if (pretouch_percent < 0)
 		pretouch_percent = psp_keep_number("txptceil", 95);
 	room = (VRAM_CACHE_END - VRAM_CACHE_START) + (arenas[1].end - arenas[1].start);
-	if (frame_set_bytes + size > room / 100 * (unsigned int)pretouch_percent)
+	if (frame_set_bytes + size > room / 100 * (unsigned int)pretouch_percent && hud)
+		hud_pretouch_past_ceiling++;
+	else if (frame_set_bytes + size > room / 100 * (unsigned int)pretouch_percent)
 	{
 		pretouch_ceiling_stops++;
 		psp_tex_chunk_missed = 1;
@@ -2267,8 +2395,10 @@ void psp_tex_pretouch(unsigned int key, int kind, int resident_only)
 			txc_note(index, kind, 0);
 			return;
 		}
-		if (frame_loaded >= LOAD_BUDGET_BYTES || !load(index))
+		if ((frame_loaded >= LOAD_BUDGET_BYTES && !hud) || !load(index))
 		{
+			if (hud)
+				hud_pretouch_refused++;
 			pretouch_refused++;
 			psp_tex_chunk_missed = 1;
 			txc_note(index, kind, 0);
@@ -2296,94 +2426,31 @@ int psp_tex_palette16(unsigned int key, const unsigned short **palette, int *cou
 	return 1;
 }
 
-/* the bake's exact CLUT4 (pack flag 2, texpack.py): a texture it would
-have made CLUT8, in 16 colours that draw it texel for texel. Its average is
-sampled where the CLUT8 bytes were, so object lighting and the flashlight
-take the same colour from it as before ("c4xavgoff": CLUT4's own sample) */
-#define EXACT_CLUT4 2
-static unsigned int texel_offset(struct pack_entry const *entry, int x, int y, int *nibble);
-
-/* a resident texture's average colour (ABGR), from a sample of its top
-level's texels through the palette; kept per texture (build 36: the
-flashlight's added light, which can't take a second texture) */
+/* a resident texture's average colour (ABGR), from the bake (the
+flashlight's added light, which can't take a second texture: build 36) */
 int psp_tex_average(unsigned int key, unsigned int *abgr)
 {
 	int index = key && entries ? find(key) : -1;
-	struct pack_entry const *entry;
-	unsigned int palette_bytes, bytes, row, rows, total, step, at, sum[3] = { 0, 0, 0 }, n = 0;
-	const unsigned char *texels;
-	static int own_sample = -1;
-	int clut8_order;
 
-	if (index < 0 || !resident_at[index] || DIRECT(&entries[index]))
+	if (index < 0 || !resident_at[index] || !averages || !baked_averages || !baked_averages[index])
 		return 0;
-	if (averages_count != entry_count || (avg_me_realloc && PSP_ME_WORK()))
-	{
-		/* the ME makes no library calls: the table comes from the pack's
-		open, and the ME's work without one has no average (avgold and
-		avgmerealloc: allocated here, as before) */
-		if (PSP_ME_WORK() && !avg_old && !avg_me_realloc)
-			return 0;
-		free(averages);
-		averages = calloc(entry_count, sizeof(unsigned int));
-		averages_count = averages ? entry_count : 0;
-		if (!averages)
-			return 0;
-	}
-	if (averages[index])
-	{
-		*abgr = averages[index];
-		return 1;
-	}
-	entry = &entries[index];
-	if (own_sample < 0)
-		own_sample = psp_keep("c4xavgoff");
-	clut8_order = entry->psm == GU_PSM_T4 && (entry->flags & EXACT_CLUT4) && !own_sample;
-	palette_bytes = (entry->clut == GU_PSM_8888 ? 4 : 2) * (entry->psm == GU_PSM_T4 ? 16 : 256);
-	bytes = entry->psm == GU_PSM_T4 && !clut8_order ? (entry->width + 1) / 2 : entry->width;
-	row = ((bytes < 16 ? 16 : bytes) + 15) & ~15u;
-	rows = (entry->height + 7) & ~7u;
-	total = row * rows;
-	step = total / 2048 + 1;
-	texels = (const unsigned char *)((resident_at[index] + palette_bytes) | 0x40000000);
-	for (at = 0; at < total; at += step)
-	{
-		unsigned int value = clut8_order ? 0 : texels[at], k;
-
-		if (clut8_order)
-		{
-			/* the texel this byte was in the CLUT8 layout; its padding read entry 0 */
-			unsigned int x = (at >> 7) % (row / 16) * 16 + (at & 15), y = (at >> 7) / (row / 16) * 8 + ((at >> 4) & 7);
-			int nibble;
-
-			if (x < entry->width && y < entry->height)
-				value = (texels[texel_offset(entry, (int)x, (int)y, &nibble)] >> (4 * nibble)) & 15;
-		}
-		for (k = 0; k < (entry->psm == GU_PSM_T4 && !clut8_order ? 2u : 1u); k++)
-		{
-			unsigned int i = entry->psm == GU_PSM_T4 && !clut8_order ? (value >> (4 * k)) & 15 : value, r, g, b;
-
-			if (entry->clut == GU_PSM_8888)
-			{
-				unsigned int c = ((const unsigned int *)(resident_at[index] | 0x40000000))[i];
-
-				r = c & 0xFF; g = (c >> 8) & 0xFF; b = (c >> 16) & 0xFF;
-			}
-			else
-			{
-				unsigned int c = ((const unsigned short *)(resident_at[index] | 0x40000000))[i];
-
-				r = (c & 31) * 255 / 31; g = ((c >> 5) & 63) * 255 / 63; b = (c >> 11) * 255 / 31;
-			}
-			sum[0] += r; sum[1] += g; sum[2] += b;
-			n++;
-		}
-	}
-	if (!n)
-		return 0;
-	averages[index] = 0xFF000000 | ((sum[2] / n) << 16) | ((sum[1] / n) << 8) | (sum[0] / n);
+	if (!averages[index])
+		averages[index] = baked_averages[index];
 	*abgr = averages[index];
 	return 1;
+}
+
+/* a resident multipurpose map's change mask (texpack.py, change_mask): the
+address of its CLUT, the data's last bytes, for the GE to load; NULL when the
+map isn't resident or the pack has no mask for it. Nothing is read */
+const void *psp_tex_change_mask(unsigned int key, int *count)
+{
+	int index = key && entries ? find(key) : -1;
+
+	if (index < 0 || !resident_at[index] || !(entries[index].flags & CHANGE_MASK))
+		return NULL;
+	*count = entries[index].psm == GU_PSM_T4 ? 16 : 256;
+	return (const void *)(resident_at[index] + entries[index].size - *count * 4);
 }
 
 /* a texture's average once worked out, even after it has left memory;
@@ -2410,7 +2477,8 @@ int psp_tex_average_known(unsigned int key, unsigned int *abgr)
 the cube's face order: +X, -X, +Y, -Y, +Z, -Z), from palette entries 1-6
 where entry 15 marks them (texpack.py, cube_patch); kept per key, so a
 gel that has left memory isn't brought back each frame. 0 when the patch
-carries none or can't be had this frame */
+carries none or can't be had this frame. A patch that keeps the cube too
+(psp_tex_gel_cube) has them in the same entries */
 
 int psp_tex_gel_faces(unsigned int key, float *faces)
 {
@@ -2432,10 +2500,11 @@ int psp_tex_gel_faces(unsigned int key, float *faces)
 	gel_faces_next = (gel_faces_next + 1) % GEL_FACES_KEPT;
 	gel_faces_kept[k].key = key;
 	gel_faces_kept[k].known = 0;
-	if (DIRECT(&entries[index]) || entries[index].clut != GU_PSM_5650 || entries[index].psm != GU_PSM_T4)
+	if (DIRECT(&entries[index]) || entries[index].clut != GU_PSM_5650)
 		return 0;
 	palette = (const unsigned short *)(resident_at[index] | 0x40000000);
-	if (palette[15] != GEL_FACES_MARK)
+	if (entries[index].psm == GU_PSM_T4 ? palette[15] != GEL_FACES_MARK :
+		entries[index].psm != GU_PSM_T8 || palette[255] != GEL_CUBE_MARK)
 		return 0;
 	for (index = 0; index < 6; index++)
 	{
@@ -2448,6 +2517,118 @@ int psp_tex_gel_faces(unsigned int key, float *faces)
 	gel_faces_kept[k].known = 1;
 	memcpy(faces, gel_faces_kept[k].faces, sizeof(gel_faces_kept[k].faces));
 	return 1;
+}
+
+/* a light's gel cube (texpack.py, gel_cube) for psp_tex_gel_cube_at, or
+NULL when its patch keeps none ("nogelcube" asks for none; then the faces'
+means shape the light, psp_tex_gel_faces) or can't be had this frame */
+const void *psp_tex_gel_cube(unsigned int key)
+{
+	int index = key && entries ? find(key) : -1, k, t;
+	const unsigned short *palette;
+	const unsigned char *texels;
+	struct gel_cube *cube;
+
+	if (index < 0)
+		return NULL;
+	for (k = 0; k < GEL_CUBES_KEPT; k++)
+		if (gel_cubes_kept[k].key == key)
+			return gel_cubes_kept[k].known ? &gel_cubes_kept[k] : NULL;
+	if (!resident_at[index] && !psp_tex_resident(key))
+		return NULL;
+	cube = &gel_cubes_kept[gel_cubes_next];
+	gel_cubes_next = (gel_cubes_next + 1) % GEL_CUBES_KEPT;
+	cube->key = key;
+	cube->known = 0;
+	if (DIRECT(&entries[index]) || entries[index].clut != GU_PSM_5650 || entries[index].psm != GU_PSM_T8 ||
+		entries[index].width != GEL_CUBE_SIDE || entries[index].height != 6 * GEL_CUBE_SIDE)
+		return NULL;
+	palette = (const unsigned short *)(resident_at[index] | 0x40000000);
+	if (palette[255] != GEL_CUBE_MARK)
+		return NULL;
+	/* a row of 16 one-byte texels is one swizzle block's width, so the
+	swizzled level is in plain row order */
+	texels = (const unsigned char *)((resident_at[index] + 256 * 2) | 0x40000000);
+	for (t = 0; t < GEL_CUBE_TEXELS; t++)
+		cube->texels[t] = palette[texels[t]];
+	cube->known = 1;
+	return cube;
+}
+
+/* the gel's colour (0-1 a channel) in direction x, y, z of its frame: the
+face of the largest axis and the place on it as a cube map lookup takes
+them (Direct3D's faces, as the Xbox's), the four nearest texels blended,
+clamped at the face's edges */
+void psp_tex_gel_cube_at(const void *gel, float x, float y, float z, float *rgb)
+{
+	const struct gel_cube *cube = (const struct gel_cube *)gel;
+	float ax = x < 0.0f ? -x : x, ay = y < 0.0f ? -y : y, az = z < 0.0f ? -z : z;
+	float major, s, t, u, v, fu, fv, w[4];
+	int face, u0, v0, u1, v1, k, at[4];
+
+	if (ax >= ay && ax >= az)
+	{
+		major = ax;
+		face = x >= 0.0f ? 0 : 1;
+		s = x >= 0.0f ? -z : z;
+		t = -y;
+	}
+	else if (ay >= az)
+	{
+		major = ay;
+		face = y >= 0.0f ? 2 : 3;
+		s = x;
+		t = y >= 0.0f ? z : -z;
+	}
+	else
+	{
+		major = az;
+		face = z >= 0.0f ? 4 : 5;
+		s = z >= 0.0f ? x : -x;
+		t = -y;
+	}
+	if (major < 1e-12f)
+	{
+		rgb[0] = rgb[1] = rgb[2] = 0.0f;
+		return;
+	}
+	u = (s / major + 1.0f) * (0.5f * GEL_CUBE_SIDE) - 0.5f;
+	v = (t / major + 1.0f) * (0.5f * GEL_CUBE_SIDE) - 0.5f;
+	if (u < 0.0f)
+		u = 0.0f;
+	if (v < 0.0f)
+		v = 0.0f;
+	if (u > GEL_CUBE_SIDE - 1)
+		u = GEL_CUBE_SIDE - 1;
+	if (v > GEL_CUBE_SIDE - 1)
+		v = GEL_CUBE_SIDE - 1;
+	u0 = (int)u;
+	v0 = (int)v;
+	u1 = u0 < GEL_CUBE_SIDE - 1 ? u0 + 1 : u0;
+	v1 = v0 < GEL_CUBE_SIDE - 1 ? v0 + 1 : v0;
+	fu = u - (float)u0;
+	fv = v - (float)v0;
+	face *= GEL_CUBE_SIDE * GEL_CUBE_SIDE;
+	at[0] = face + v0 * GEL_CUBE_SIDE + u0;
+	at[1] = face + v0 * GEL_CUBE_SIDE + u1;
+	at[2] = face + v1 * GEL_CUBE_SIDE + u0;
+	at[3] = face + v1 * GEL_CUBE_SIDE + u1;
+	w[0] = (1.0f - fu) * (1.0f - fv);
+	w[1] = fu * (1.0f - fv);
+	w[2] = (1.0f - fu) * fv;
+	w[3] = fu * fv;
+	rgb[0] = rgb[1] = rgb[2] = 0.0f;
+	for (k = 0; k < 4; k++)
+	{
+		unsigned int c = cube->texels[at[k]];
+
+		rgb[0] += w[k] * (float)(c & 31);
+		rgb[1] += w[k] * (float)((c >> 5) & 63);
+		rgb[2] += w[k] * (float)(c >> 11);
+	}
+	rgb[0] *= 1.0f / 31.0f;
+	rgb[1] *= 1.0f / 63.0f;
+	rgb[2] *= 1.0f / 31.0f;
 }
 
 /* ---------- build 102: object lighting from the lightmaps
@@ -2570,9 +2751,20 @@ int psp_tex_light_texel(unsigned int key, float u, float v, unsigned int *argb)
 	{
 		*argb = light_last[slot].argb;
 		light_last_used++;
+		/* the page's last colour stands in: not this point's own (B30) */
+		{
+			extern int psp_light_miss;
+
+			psp_light_miss = 1;
+		}
 		return 1;
 	}
 	light_white++;
+	{
+		extern int psp_light_miss;
+
+		psp_light_miss = 1;
+	}
 	return 0;
 }
 
@@ -2627,9 +2819,12 @@ int psp_tex_light_average(unsigned int key, unsigned int *argb)
 
 void psp_tex_light_report(void)
 {
-	if (light_exact + light_read + light_last_used + light_white)
-		platform_log("object lighting: lightmap samples %lu from resident textures, %lu read from the pack (%lu us in all), %lu the page's last colour, %lu white (nothing to go on)",
-			light_exact, light_read, light_read_us, light_last_used, light_white);
+	/* object_lights.c and render_objects.c (psp_fixups.py: FIXES_36, FIXES_B30) */
+	extern unsigned long psp_object_light_samples_missed, psp_light_retries;
+
+	if (light_exact + light_read + light_last_used + light_white + psp_object_light_samples_missed)
+		platform_log("object lighting: lightmap samples %lu from resident textures, %lu read from the pack (%lu us in all), %lu the page's last colour, %lu white (nothing to go on); %lu reads with no floor copies; objects sampled again after a miss %lu",
+			light_exact, light_read, light_read_us, light_last_used, light_white, psp_object_light_samples_missed, psp_light_retries);
 }
 
 /* whether the pack has a texture under this key (build 36: a model's base map
@@ -2715,8 +2910,10 @@ void psp_tex_frame_end(void)
 			loads, load_bytes / 1024, misses - (loads - preloaded), waits, evictions, frame_set_peak_count, frame_set_peak / 1024,
 			untextured_frames, untextured_run_worst);
 	if (entries && frame % 300 == 0)
-		platform_log("textures, the HUD's and the screen's (%s): %lu missing when drawn (%lu read past the frame's budget), %lu drawn untextured",
-			hud_pin_on > 0 ? "pinned" : "hudpinoff", hud_misses, hud_reads_past_budget, hud_untextured);
+		platform_log("textures, the HUD's and the screen's (%s): %lu missing when drawn (%lu read past the frame's budget), %lu drawn untextured; recorded for the Media Engine (%s): %lu marked, %lu past the ceiling, %lu refused room; read back at a frame's start %lu, refused %lu (%d pinned, %u KB, %u KB of them resident)",
+			hud_pin_on > 0 ? "pinned" : "hudpinoff", hud_misses, hud_reads_past_budget, hud_untextured,
+			hud_pin_me > 0 ? "hudpinme" : hud_pin_me == 0 ? "hudpinmeold" : "none yet", hud_pretouched, hud_pretouch_past_ceiling,
+			hud_pretouch_refused, hud_frame_start_loads, hud_frame_start_refused, hud_pin_count, hud_pin_kb(0), hud_pin_kb(1));
 	if (entries && frame % 300 == 0)
 		psp_tex_light_report();
 	if (entries && frame % 300 == 0 && bind_blocks_on > 0)

@@ -1,0 +1,21 @@
+{
+  "about": "The disc images the releases were baked from and tested with (bake.py, fingerprint). A bake from any other image still runs; its stamp (halo/bake.txt) and log say it isn't one of these. Each entry: the image's name as its owner had it, its SHA-1 (whole file), default.xbe's SHA-256, the title record's version, and the builds tested with it.",
+  "images": [
+    {
+      "name": "Halo - Combat Evolved (USA) (Rev 2).xiso.iso",
+      "note": "an xiso (the Xbox file system repacked, not the raw disc), so its SHA-1, MD5 and CRC32 are its own, not a disc-preservation database's; default.xbe's hash and title record match any copy of the same disc",
+      "image_size": 3625713664,
+      "image_sha1": "bf3e1071bf8b7f0080cae86adc32b44233dbe8aa",
+      "image_md5": "5c01ab03aacd58c9c50798fe64d5e27c",
+      "image_crc32": "0b6667ce",
+      "xbe_sha256": "4094e994243ddeae3f1b478bde6a7ee81498218ccd7c9d7bc2327db547d95aae",
+      "xbe_title_id": "4D530004",
+      "xbe_version": 9,
+      "xbe_regions": "North America",
+      "maps_retail": "11 of 11",
+      "builds": [
+        "b146"
+      ]
+    }
+  ]
+}

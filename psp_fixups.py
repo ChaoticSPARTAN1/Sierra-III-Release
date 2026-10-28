@@ -38,6 +38,9 @@ static boolean psp_animation_valid = FALSE;
 along the view, for its parts' reflections (psp_ge.c, psp_ge_model_reflection) */
 static real_argb_color psp_reflection_tint;
 static real psp_model_camera_distance = 0.0f;
+/* which of Chief's parts the part being drawn is (1 his visor, 2 his armour
+or hands, 0 none): set with its reflection, read by its detail map */
+static int psp_chief_part = 0;
 /* a model's distance along the view: models.c's rso works it out the same way,
 to check a kept reflection's fade (psp_ge.c, rso) */
 real psp_model_distance_along_view(real const *point)
@@ -451,7 +454,12 @@ static unsigned int psp_transparent_map(struct shader const *shader, short permu
 				and +344 */
 				extern void psp_ge_model_reflection(unsigned int cube_key, float const *rgb);
 				long cube = model_shader ? *(long const *)(definition + 368) : NONE;
-				float reflection[3] = { 0.0f, 0.0f, 0.0f };
+
+				psp_chief_part = 0;
+				/* the strength, then which of Chief's parts this shader is
+				(1 his visor, 2 his armour, 0 none): the centerpiece gets
+				passes of its own (psp_ge.c, chiefvisor) */
+				float reflection[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
 				if (cube != NONE)
 				{
@@ -474,14 +482,81 @@ static unsigned int psp_transparent_map(struct shader const *shader, short permu
 						reflection[channel] = brightness * 0.5f * (perpendicular[channel] + parallel[channel]) *
 							(&psp_reflection_tint.red)[channel];
 				}
+				if (cube != NONE)
+				{
+					/* Chief's parts by their shaders' names, once a shader a map:
+					the name is looked up through the shader tags */
+					extern int psp_map_generation;
+					extern char const *psp_shader_tag_name(void const *shader);
+					static void const *chief_shader[64];
+					static signed char chief_kind[64];
+					static int chief_count = 0, chief_generation = -1;
+					int k, kind = -1;
+
+					if (chief_generation != psp_map_generation)
+					{
+						chief_generation = psp_map_generation;
+						chief_count = 0;
+					}
+					for (k = 0; k < chief_count; k++)
+						if (chief_shader[k] == definition)
+						{
+							kind = chief_kind[k];
+							break;
+						}
+					if (kind < 0)
+					{
+						char const *name = psp_shader_tag_name(definition);
+
+						kind = !name ? 0 : !strcmp(name, "characters\\\\cyborg\\\\shaders\\\\visor") ? 1 :
+							!strncmp(name, "characters\\\\cyborg\\\\", 18) ? 2 : 0;
+						if (chief_count < 64)
+						{
+							chief_shader[chief_count] = definition;
+							chief_kind[chief_count++] = (signed char)kind;
+						}
+						if (kind > 0)
+							platform_log("chief: %s is Chief's %s (map load %d)", name, kind == 1 ? "visor" : "armour", psp_map_generation);
+					}
+					reflection[3] = (float)kind;
+					psp_chief_part = kind;
+				}
 				psp_ge_model_reflection(cube != NONE ? psp_tex_bitmap_key(cube, 0) : 0, reflection);
+				if (cube != NONE && PSP_KEEP_ONCE("refldump"))
+				{
+					/* each shiny shader once a map: which part is which (Chief's
+					visor against his armour), and the strengths that pick them */
+					extern char const *psp_shader_tag_name(void const *shader);
+					static void const *dumped[64];
+					static int dumped_count = 0;
+					int k;
+
+					for (k = 0; k < dumped_count && dumped[k] != definition; k++)
+						;
+					if (k == dumped_count && dumped_count < 64)
+					{
+						char const *name = psp_shader_tag_name(definition);
+
+						dumped[dumped_count++] = definition;
+						platform_log("refldump: %s reflection %.3f %.3f %.3f (brightness %.2f / %.2f, tint %.2f %.2f %.2f / %.2f %.2f %.2f, the lighting's %.2f %.2f %.2f x %.2f) multipurpose %s",
+							name ? name : "(no tag)", reflection[0], reflection[1], reflection[2],
+							*(float const *)(definition + 324), *(float const *)(definition + 340),
+							((float const *)(definition + 328))[0], ((float const *)(definition + 328))[1], ((float const *)(definition + 328))[2],
+							((float const *)(definition + 344))[0], ((float const *)(definition + 344))[1], ((float const *)(definition + 344))[2],
+							psp_reflection_tint.red, psp_reflection_tint.green, psp_reflection_tint.blue, psp_reflection_tint.alpha,
+							multipurpose != NONE ? "yes" : "none");
+					}
+				}
 			}
 			/* on the main menu, the detail map itself over the base that holds
 			its average (psp_ge.c, model_detail_pass): shaders with the double
 			multiply and no mask, whose folded base the pack has. Its scale is
 			on the base map's coordinates, v by the v scale too, as the Xbox's
 			vertex constants have it (rasterizer_xbox_models.c) */
-			if (psp_showcase_map)
+			/* "chiefdetail": Chief's armour too, the centerpiece in every
+			level, as the ring is on the menu; every other
+			part then sends none, so his detail map never carries over */
+			if (psp_showcase_map || PSP_KEEP_ONCE("chiefdetail"))
 			{
 				extern void psp_ge_model_detail(unsigned int, float, float);
 				long detail = model_shader ? *(long const *)(definition + 232) : NONE;
@@ -492,7 +567,8 @@ static unsigned int psp_transparent_map(struct shader const *shader, short permu
 					scale = 1.0f;
 				if (v_detail == 0.0f)
 					v_detail = 1.0f;
-				psp_ge_model_detail(detail != NONE && (base_key & 1) && *(short const *)(definition + 212) == 0 &&
+				psp_ge_model_detail((psp_showcase_map || psp_chief_part == 2) &&
+					detail != NONE && (base_key & 1) && *(short const *)(definition + 212) == 0 &&
 					*(short const *)(definition + 214) == 0 ? psp_tex_bitmap_key(detail, 0) : 0,
 					(u_scale ? u_scale : 1.0f) * scale, (v_scale ? v_scale : 1.0f) * scale * v_detail);
 			}
@@ -1745,11 +1821,23 @@ if os.environ.get("PSP_TICK_STEPS", "") == "1":
                                          # perception's own parts: which of them the line of sight is
                                          ("void prop_position_refresh(", None),
                                          ("static void actor_perception_refresh_danger_zone(", None)],
-        "source/objects/objects.c": [("static boolean object_update(", None)],
+        # objects_update too: object_update's last call for bipeds and vehicles
+        # is the accounting, so without markers in the loop that step held the
+        # loop's own work (on-demand node matrices, attachments, the next
+        # object's set-up) under the accounting's name
+        "source/objects/objects.c": [("static boolean object_update(", None), ("void objects_update(", None)],
     })
     # prop_status_refresh's calls are assignments, which the call pattern
     # can't see: labelled steps split it instead
     STEP_LABELS_TICK = {
+        # HOIST writes these calls as "psp_hoist ? f_with(...) : f(...)", which
+        # the per-call markers don't see, so their time went to the step before
+        # them (an accounting call): labelled here instead
+        "source/objects/objects.c": [
+            ("\t\t\t\tpsp_hoist ? object_compute_node_matrices_with(object_index, object, object_definition) : object_compute_node_matrices(object_index);\n",
+             "object_compute_node_matrices", "before"),
+            ("#ifdef HALO_PSP\n\t\t\tif (!psp_lights_defer(object_index))", "object_connect_lights", "before"),
+        ],
         "source/ai/actor_perception.c": [
             ("\t\tprop->ignore = TEST_FLAG(unit->unit.flags, _unit_ignored_by_actors_bit);\n",
              "prop_status_refresh: start", "before"),
@@ -1922,6 +2010,25 @@ def step_call(match):
         return match.group(0)
     return '%s(PSP_STEP("%s"), %s(%s));' % (match.group(1), match.group(2), match.group(2), match.group(3))
 
+# A step runs from its marker to the next, and markers go before calls made
+# as statements: a call inside a conditional expression ("a ? f() : g()", as
+# HOIST writes its calls) gets none, so its time is booked to whatever step
+# came before it. Named in the build log so a split can be read with that in
+# mind, or the call given a label (STEP_LABELS). Short helpers are left out
+UNMARKED = re.compile(r"[?:]\s*\(?\s*([a-z_][a-z0-9_]{5,})\s*\(")
+UNMARKED_IGNORE = {"psp_microseconds", "object_get", "object_definition_get", "datum_get", "unit_get", "biped_get",
+                   "actor_get", "prop_get", "sizeof", "magnitude3d", "magnitude_squared3d", "normalize3d", "dot_product3d"}
+
+def unmarked_calls(body):
+    found = []
+    for line in body.split("\n"):
+        if "PSP_STEP(" in line or line.lstrip().startswith(("//", "/*", "*", "#")):
+            continue
+        for m in UNMARKED.finditer(line):
+            if m.group(1) not in UNMARKED_IGNORE and m.group(1) not in found:
+                found.append(m.group(1))
+    return found
+
 def breadcrumbs(tree):
     changed = 0
     for rel, functions in STEPS.items():
@@ -1933,7 +2040,12 @@ def breadcrumbs(tree):
             start, end = definition(text, function)
             if stop:
                 end = text.index(stop, start)
-            text = text[:start] + CALL.sub(step_call, text[start:end]) + text[end:]
+            body = CALL.sub(step_call, text[start:end])
+            unseen = unmarked_calls(body)
+            if unseen:
+                print("psp_fixups: steps: %s %s: calls the markers don't see (their time goes to the step before, unless STEP_LABELS gives them one): %s"
+                      % (rel, function.split("(")[0].split()[-1], ", ".join(unseen)))
+            text = text[:start] + body + text[end:]
         open(path, "w", errors="surrogateescape").write(declare_step(text))
         changed += 1
     for rel, lines in STEP_LINES.items():
@@ -2283,6 +2395,21 @@ void psp_player_teleport(float x, float y, float z, float fx, float fy, float fz
 
 	if (unit_index == NONE)
 		return;
+	/* a seated unit's position is its seat's offset, so a spot written
+	there was read from the seat: a10's cryo pod held Chief 56 units off and
+	he vanished leaving it (B32, a route's spot at 228.5 s). The spot is
+	where the tester stood; seated, he stood nowhere */
+	if (object_get(unit_index)->object.parent_object_index != NONE)
+	{
+		static int psp_seated_logged = 0;
+
+		if (!psp_seated_logged)
+		{
+			psp_seated_logged = 1;
+			platform_psp_log("teleport: a spot passed over while the player is seated (game time %ld)", game_time_get());
+		}
+		return;
+	}
 	position.x = x; position.y = y; position.z = z;
 	facing.i = fx; facing.j = fy; facing.k = fz;
 	object_set_position(unit_index, &position, NULL, NULL);
@@ -8162,6 +8289,13 @@ FIXES_36["source/objects/object_lights.c#geometry"] = [
 extern long psp_structure_vertex_stride; /* psp_geo.c; psp_fixups.py */
 int psp_ge_level_vertex_texcoords(unsigned long key, int vertex_index, float *uv, float *lightmap_uv); /* psp_ge.c */
 unsigned long psp_object_light_samples_missed = 0;
+/* B30: set by any read of this sample that had nothing real to go on (the
+copies or normals not there this frame, psp_tex.c's white or page's-last-colour
+answers); lights_distant_lighting_at_point then reports no sample */
+int psp_light_miss = 0;
+/* B30: set while an object is sampled when any of its points missed;
+render_objects.c samples it again until one doesn't (FIXES_B30) */
+int psp_light_object_missed = 0;
 
 /* the three vertices' coordinates from the renderer's copies when the data
 is in the geometry pack: 1 if they are there, 0 if not this frame */
@@ -8178,6 +8312,7 @@ static int psp_material_texcoords(struct structure_material const *material, str
 			surface->vertex_indices[k], uv, lightmap_uv))
 		{
 			psp_object_light_samples_missed++;
+			psp_light_miss = 1;
 			return 0;
 		}
 		texcoords[k].x = lightmap ? lightmap_uv[0] : uv[0];
@@ -8212,6 +8347,7 @@ static void psp_material_normals(struct structure_material const *material, stru
 			normals[k].j = 0.0f;
 			normals[k].k = 1.0f;
 			psp_object_light_samples_missed++;
+			psp_light_miss = 1;
 		}
 	}
 }
@@ -26437,6 +26573,360 @@ struct unit_control_data const *psp_drive_control(long unit_index, struct unit_c
 ]
 
 
+
+# ---------- FIXES_COMPACTSKIP: a compaction of a pool already compact (research, GCLATE)
+#
+# Late in b30 the object garbage collector runs every tick with active garbage
+# over its trigger, collects nothing (every body in view), and still compacts
+# the object pool: a walk of every block header (lab levers.tsv GCLATE). A
+# pool whose blocks already lie end to end (its contiguous free room equals
+# its free room) has nothing to move, and the walk would only rewrite links
+# that already hold, so it is skipped. Exact by construction: the pool's bytes
+# and links are what the walk would leave. Keep word "compactalways" walks as
+# before; "compactcheck" walks anyway and counts blocks the skip would have
+# left out of place (psp_compact_report, expected 0).
+
+FIXES_COMPACTSKIP = {}
+FIXES_COMPACTSKIP["source/memory/memory_pool.c#compactskip"] = [
+("""void memory_pool_compact(
+	struct memory_pool *pool)
+{
+	byte *destination;
+	struct memory_pool_block *block;
+	struct memory_pool_block *previous_block;
+
+	block = pool->first_block;
+	if (block)
+	{
+		destination = pool->base_address;
+		previous_block = NULL;
+		do
+		{
+			if ((byte *)block > destination)
+			{
+""",
+"""#ifdef HALO_PSP
+/* psp_fixups.py (FIXES_COMPACTSKIP): 1 skip, 0 walk always, 2 walk and check */
+int psp_keep(const char *name);
+static int psp_compact_mode = -1;
+unsigned int psp_compact_skipped, psp_compact_walked, psp_compact_check_moved;
+#endif
+
+void memory_pool_compact(
+	struct memory_pool *pool)
+{
+	byte *destination;
+	struct memory_pool_block *block;
+	struct memory_pool_block *previous_block;
+#ifdef HALO_PSP
+	boolean psp_already_compact;
+
+	if (psp_compact_mode < 0)
+		psp_compact_mode = psp_keep("compactcheck") ? 2 : psp_keep("compactalways") || psp_keep("smallwins1old") ? 0 : 1;
+	psp_already_compact = pool->size - memory_pool_get_used_size(pool) == pool->free_size;
+	if (psp_already_compact && psp_compact_mode == 1)
+	{
+		psp_compact_skipped++;
+		return;
+	}
+	psp_compact_walked++;
+#endif
+
+	block = pool->first_block;
+	if (block)
+	{
+		destination = pool->base_address;
+		previous_block = NULL;
+		do
+		{
+			if ((byte *)block > destination)
+			{
+#ifdef HALO_PSP
+				if (psp_already_compact)
+					psp_compact_check_moved++;
+#endif
+"""),
+]
+
+
+# ---------- FIXES_GCHEAD: the garbage collector's player heads, once a collection (research, GCLATE)
+#
+# Late in b30 the collector tests ~200 garbage objects a tick against every
+# player's view (object_visible_to_any_player, its only caller), and each test
+# finds the player's head with object_get_marker_by_name: a search of the
+# model's markers by name and a node transform, the same answer every time
+# within one collection (it deletes garbage only, never the player's unit).
+# The head is found once a collection and kept for the rest of it. Exact by
+# construction in the emulator, but NOT on the PSP: there the on side removed
+# 7-9 garbage objects in the player's view in its first collection, as if the
+# kept head were not where it is (the PSP-3000 pair 40484028762; the off side
+# removed none in 192 collections). Until that is understood it is opt-in:
+# keep word "gchead"; "smallwins1old" turns the whole batch off
+
+FIXES_GCHEAD = {}
+FIXES_GCHEAD["source/objects/objects.c#gchead"] = [
+("""boolean object_visible_to_any_player(
+	long object_index)
+{""",
+"""#ifdef HALO_PSP
+/* psp_fixups.py (FIXES_GCHEAD) */
+extern int psp_keep(const char *name);
+static int psp_gc_head_mode = -1; /* 1 kept for a collection, 0 as before */
+static int psp_gc_heads_live;
+static long psp_gc_head_unit[16];
+static real_point3d psp_gc_head_position[16];
+unsigned int psp_gc_head_found, psp_gc_head_kept;
+
+static void psp_gc_heads_begin(void)
+{
+	int k;
+
+	if (psp_gc_head_mode < 0)
+		psp_gc_head_mode = psp_keep("gchead") && !psp_keep("smallwins1old");
+	for (k = 0; k < 16; k++)
+		psp_gc_head_unit[k] = NONE;
+	psp_gc_heads_live = psp_gc_head_mode;
+}
+
+static void psp_gc_head(long player_index, long unit_index, real_point3d *position)
+{
+	int slot = DATUM_INDEX_TO_ABSOLUTE_INDEX(player_index) & 15;
+
+	if (psp_gc_heads_live && psp_gc_head_unit[slot] == unit_index)
+	{
+		*position = psp_gc_head_position[slot];
+		psp_gc_head_kept++;
+		return;
+	}
+	unit_get_head_position(unit_index, position);
+	psp_gc_head_found++;
+	if (psp_gc_heads_live)
+	{
+		psp_gc_head_unit[slot] = unit_index;
+		psp_gc_head_position[slot] = *position;
+	}
+}
+#endif
+
+boolean object_visible_to_any_player(
+	long object_index)
+{"""),
+("""					unit_get_head_position(player->unit_index, &player_position);
+""",
+"""#ifdef HALO_PSP
+					psp_gc_head(player_index, player->unit_index, &player_position);
+#else
+					unit_get_head_position(player->unit_index, &player_position);
+#endif
+"""),
+("""			garbage_collect_mode_wide = garbage_collect_mode;
+""",
+"""			garbage_collect_mode_wide = garbage_collect_mode;
+#ifdef HALO_PSP
+			psp_gc_heads_begin();
+#endif
+"""),
+("""		/* port: in network co-op, active garbage left above its target is
+""",
+"""#ifdef HALO_PSP
+		psp_gc_heads_live = 0;
+#endif
+		/* port: in network co-op, active garbage left above its target is
+"""),
+]
+
+# ---------- FIXES_SMALLWINS2: small wins batch 2
+#
+# Shelved small wins revived, each exact, each with its own off word, all off
+# with "smallwins2old".
+#
+# VIS ("visrectold"; check "visrectcheck"): the visibility walk clips each
+# portal's screen hull against the region seen so far (convex_hull2d_intersect,
+# a clip by every edge). When the two hulls' bounding rectangles lie apart by
+# more than the clip's tolerance, the clip can only come back empty, and the
+# walk skips it. A survey counted ~92-96 such clips a frame on
+# b30. The check runs the clip anyway for every one skipped and counts any
+# that wasn't empty (expected 0; the metrics line).
+FIXES_SMALLWINS2 = {}
+FIXES_SMALLWINS2["source/structures/structure_visibility.c#visrect"] = [
+("""#define PSP_PORTAL_STEPS 160
+""",
+"""/* psp_fixups.py (FIXES_SMALLWINS2 #visrect) */
+extern int psp_keep(const char *name);
+static int psp_visrect_mode = -1; /* 1 skip, 0 as before, 2 check */
+unsigned int psp_visrect_skipped, psp_visrect_check_kept;
+#define PSP_VISRECT_MARGIN 0.01f
+
+static int psp_visrect_apart(struct portal_hull const *a, struct portal_hull const *b)
+{
+	real ax0, ax1, ay0, ay1, bx0, bx1, by0, by1;
+	short k;
+
+	if (psp_visrect_mode < 0)
+		psp_visrect_mode = psp_keep("visrectcheck") ? 2 :
+			psp_keep("visrectold") || psp_keep("smallwins2old") ? 0 : 1;
+	if (!psp_visrect_mode || a->vertex_count <= 0 || b->vertex_count <= 0)
+		return 0;
+	ax0 = ax1 = a->vertices[0].x;
+	ay0 = ay1 = a->vertices[0].y;
+	for (k = 1; k < a->vertex_count; k++)
+	{
+		if (a->vertices[k].x < ax0) ax0 = a->vertices[k].x;
+		if (a->vertices[k].x > ax1) ax1 = a->vertices[k].x;
+		if (a->vertices[k].y < ay0) ay0 = a->vertices[k].y;
+		if (a->vertices[k].y > ay1) ay1 = a->vertices[k].y;
+	}
+	bx0 = bx1 = b->vertices[0].x;
+	by0 = by1 = b->vertices[0].y;
+	for (k = 1; k < b->vertex_count; k++)
+	{
+		if (b->vertices[k].x < bx0) bx0 = b->vertices[k].x;
+		if (b->vertices[k].x > bx1) bx1 = b->vertices[k].x;
+		if (b->vertices[k].y < by0) by0 = b->vertices[k].y;
+		if (b->vertices[k].y > by1) by1 = b->vertices[k].y;
+	}
+	if (bx0 > ax1 + PSP_VISRECT_MARGIN || bx1 < ax0 - PSP_VISRECT_MARGIN ||
+		by0 > ay1 + PSP_VISRECT_MARGIN || by1 < ay0 - PSP_VISRECT_MARGIN)
+	{
+		psp_visrect_skipped++;
+		return psp_visrect_mode == 1 ? 1 : 2;
+	}
+	return 0;
+}
+
+#define PSP_PORTAL_STEPS 160
+"""),
+("""				struct portal_hull clipped_hull;
+
+				clipped_hull.vertex_count = convex_hull2d_intersect(
+					visible_region->vertex_count,
+					visible_region->vertices,
+					portal_hull.vertex_count,
+					portal_hull.vertices,
+					MAXIMUM_PORTAL_HULL_VERTICES,
+					clipped_hull.vertices,
+					0.0001f);
+""",
+"""				struct portal_hull clipped_hull;
+#ifdef HALO_PSP
+				int psp_apart = psp_visrect_apart(visible_region, &portal_hull);
+
+				if (psp_apart == 1)
+					clipped_hull.vertex_count = 0;
+				else
+#endif
+				clipped_hull.vertex_count = convex_hull2d_intersect(
+					visible_region->vertex_count,
+					visible_region->vertices,
+					portal_hull.vertex_count,
+					portal_hull.vertices,
+					MAXIMUM_PORTAL_HULL_VERTICES,
+					clipped_hull.vertices,
+					0.0001f);
+#ifdef HALO_PSP
+				if (psp_apart == 2 && clipped_hull.vertex_count != 0)
+					psp_visrect_check_kept++;
+#endif
+"""),
+]
+
+def snd_eval(code):
+    old = ("\t\tmatch_assert(\n\t\t\t\"c:\\\\halo\\\\SOURCE\\\\sound\\\\sound_manager.c\",\n\t\t\t%s,\n"
+           "\t\t\tsound_cache_sound_loaded(permutation));\n") % code
+    new = ("\t\t{\n"
+           "\t\t\t/* psp_fixups.py (FIXES_ASSERTSEVAL): the request is the game's,\n"
+           "\t\t\tnot only the check's (an LRU touch, the sound's first-sight\n"
+           "\t\t\tset-up), so it's made even where asserts are compiled out */\n"
+           "\t\t\tboolean psp_sound_loaded = sound_cache_sound_loaded(permutation);\n\n"
+           "\t\t\tmatch_assert(\n\t\t\t\t\"c:\\\\halo\\\\SOURCE\\\\sound\\\\sound_manager.c\",\n\t\t\t\t%s,\n"
+           "\t\t\t\tpsp_sound_loaded);\n\t\t\t(void)psp_sound_loaded;\n\t\t}\n") % code
+    return (old, new)
+
+# ---------- FIXES_ASSERTSEVAL: asserts whose expressions do the game's work (research, X10)
+#
+# PSP_ASSERTS_OFF compiles the fatal asserts out without evaluating them. Two
+# kinds of assert expression do work the game needs: the sound manager's
+# check that a sound is loaded is itself the cache request (an LRU touch and
+# the sound's first-sight set-up, xbox_sound_cache.c), and the keyframe
+# search's loop guard counts inside its assert. Both now do their work
+# outside the assert, so compiling the checks out leaves it; with asserts kept
+# nothing changes (assertsoff1 40460818822, api-job 40473519163).
+FIXES_ASSERTSEVAL = {}
+# The asserts whose expression is the game's own work, which a later
+# ChupathingyCE marks match_vassert_evaluated (not at our pin): the obstacle
+# path's heap_insert and the script compiler's hs_parse_variable. With asserts
+# compiled out they were dropped: assertsoff5 (40490801164), compiling out
+# only ai/'s asserts, parted b30 at tick 82
+FIXES_ASSERTSEVAL["source/ai/path_obstacle_avoidance.c#heap"] = [
+("""		match_vassert("c:\\\\halo\\\\SOURCE\\\\ai\\\\path_obstacle_avoidance.c", 420, heap_insert(path, step_index), NULL);
+""",
+"""		{
+			/* psp_fixups.py (FIXES_ASSERTSEVAL): the insert is the game's */
+			boolean psp_inserted = heap_insert(path, step_index);
+
+			match_vassert("c:\\\\halo\\\\SOURCE\\\\ai\\\\path_obstacle_avoidance.c", 420, psp_inserted, NULL);
+			(void)psp_inserted;
+		}
+"""),
+]
+FIXES_ASSERTSEVAL["source/hs/hs_compile.c#variable"] = [
+("""						match_vassert(
+							"c:\\\\halo\\\\source\\\\hs\\\\hs_library_internal_compile.h",
+							0x126,
+							hs_parse_variable(variable_expression_index),
+							"asserted");
+""",
+"""						{
+							/* psp_fixups.py (FIXES_ASSERTSEVAL): the parse is the game's */
+							boolean psp_parsed = hs_parse_variable(variable_expression_index);
+
+							match_vassert(
+								"c:\\\\halo\\\\source\\\\hs\\\\hs_library_internal_compile.h",
+								0x126,
+								psp_parsed,
+								"asserted");
+							(void)psp_parsed;
+						}
+"""),
+]
+FIXES_ASSERTSEVAL["source/sound/sound_manager.c#loaded"] = [snd_eval("0x79A"), snd_eval("0x9DA")]
+# The frame data checks ask the animation cache for the frame again
+# (psp_anim.c keeps the last few ranges it hands out), and with asserts
+# compiled out that second request was gone: assertsoff3 (40489515548) saw
+# b30's objects and actors part at tick 82. Asked for outside the check
+FIXES_ASSERTSEVAL["source/models/model_animations.c#framedata"] = [
+('\t\tmatch_assert(\n\t\t\t"c:\\\\halo\\\\SOURCE\\\\models\\\\model_animations.c",\n\t\t\t321,\n\t\t\tcompressed || (byte *)data-(byte *)animation_get_frame_data(animation, frame_index)==animation->frame_size);\n',
+ '\t\t{\n\t\t\t/* psp_fixups.py (FIXES_ASSERTSEVAL): asked for again, as the check\n\t\t\talways did (the animation cache\'s handouts, psp_anim.c), even\n\t\t\twhere asserts are compiled out */\n\t\t\tbyte *psp_check_data = compressed ? NULL : animation_get_frame_data(animation, frame_index);\n\n\t\t\tmatch_assert(\n\t\t\t\t"c:\\\\halo\\\\SOURCE\\\\models\\\\model_animations.c",\n\t\t\t\t321,\n\t\t\t\tcompressed || (byte *)data-(byte *)psp_check_data==animation->frame_size);\n\t\t\t(void)psp_check_data;\n\t\t}\n'),
+('\t\tmatch_assert(\n\t\t\t"c:\\\\halo\\\\SOURCE\\\\models\\\\model_animations.c",\n\t\t\t391,\n\t\t\tcompressed || ((byte *)data-(byte *)animation_get_frame_data(animation, frame_index)==animation->frame_size));\n',
+ '\t\t{\n\t\t\t/* psp_fixups.py (FIXES_ASSERTSEVAL): asked for again, as the check\n\t\t\talways did (the animation cache\'s handouts, psp_anim.c), even\n\t\t\twhere asserts are compiled out */\n\t\t\tbyte *psp_check_data = compressed ? NULL : animation_get_frame_data(animation, frame_index);\n\n\t\t\tmatch_assert(\n\t\t\t\t"c:\\\\halo\\\\SOURCE\\\\models\\\\model_animations.c",\n\t\t\t\t391,\n\t\t\t\tcompressed || ((byte *)data-(byte *)psp_check_data==animation->frame_size));\n\t\t\t(void)psp_check_data;\n\t\t}\n'),
+('\t\tmatch_assert(\n\t\t\t"c:\\\\halo\\\\SOURCE\\\\models\\\\model_animations.c",\n\t\t\t470,\n\t\t\tcompressed || ((byte *)data-(byte *)animation_get_frame_data(animation, frame_index)==animation->frame_size));\n',
+ '\t\t{\n\t\t\t/* psp_fixups.py (FIXES_ASSERTSEVAL): asked for again, as the check\n\t\t\talways did (the animation cache\'s handouts, psp_anim.c), even\n\t\t\twhere asserts are compiled out */\n\t\t\tbyte *psp_check_data = compressed ? NULL : animation_get_frame_data(animation, frame_index);\n\n\t\t\tmatch_assert(\n\t\t\t\t"c:\\\\halo\\\\SOURCE\\\\models\\\\model_animations.c",\n\t\t\t\t470,\n\t\t\t\tcompressed || ((byte *)data-(byte *)psp_check_data==animation->frame_size));\n\t\t\t(void)psp_check_data;\n\t\t}\n'),
+('\t\tmatch_assert(\n\t\t\t"c:\\\\halo\\\\SOURCE\\\\models\\\\model_animations.c",\n\t\t\t554,\n\t\t\tcompressed || ((byte *)data-(byte *)animation_get_frame_data(animation, frame_index)==animation->frame_size));\n',
+ '\t\t{\n\t\t\t/* psp_fixups.py (FIXES_ASSERTSEVAL): asked for again, as the check\n\t\t\talways did (the animation cache\'s handouts, psp_anim.c), even\n\t\t\twhere asserts are compiled out */\n\t\t\tbyte *psp_check_data = compressed ? NULL : animation_get_frame_data(animation, frame_index);\n\n\t\t\tmatch_assert(\n\t\t\t\t"c:\\\\halo\\\\SOURCE\\\\models\\\\model_animations.c",\n\t\t\t\t554,\n\t\t\t\tcompressed || ((byte *)data-(byte *)psp_check_data==animation->frame_size));\n\t\t\t(void)psp_check_data;\n\t\t}\n'),
+('\t\tmatch_assert(\n\t\t\t"c:\\\\halo\\\\SOURCE\\\\models\\\\model_animations.c",\n\t\t\t693,\n\t\t\tcompressed || ((byte *)data-(byte *)animation_get_frame_data(animation, frame_index)==animation->frame_size));\n',
+ '\t\t{\n\t\t\t/* psp_fixups.py (FIXES_ASSERTSEVAL): asked for again, as the check\n\t\t\talways did (the animation cache\'s handouts, psp_anim.c), even\n\t\t\twhere asserts are compiled out */\n\t\t\tbyte *psp_check_data = compressed ? NULL : animation_get_frame_data(animation, frame_index);\n\n\t\t\tmatch_assert(\n\t\t\t\t"c:\\\\halo\\\\SOURCE\\\\models\\\\model_animations.c",\n\t\t\t\t693,\n\t\t\t\tcompressed || ((byte *)data-(byte *)psp_check_data==animation->frame_size));\n\t\t\t(void)psp_check_data;\n\t\t}\n'),
+('\t\tmatch_assert(\n\t\t\t"c:\\\\halo\\\\SOURCE\\\\models\\\\model_animations.c",\n\t\t\t694,\n\t\t\tcompressed || ((byte *)next_data-(byte *)animation_get_frame_data(animation, next_frame_index)==animation->frame_size));\n',
+ '\t\t{\n\t\t\t/* psp_fixups.py (FIXES_ASSERTSEVAL): asked for again, as the check\n\t\t\talways did (the animation cache\'s handouts, psp_anim.c), even\n\t\t\twhere asserts are compiled out */\n\t\t\tbyte *psp_check_data = compressed ? NULL : animation_get_frame_data(animation, next_frame_index);\n\n\t\t\tmatch_assert(\n\t\t\t\t"c:\\\\halo\\\\SOURCE\\\\models\\\\model_animations.c",\n\t\t\t\t694,\n\t\t\t\tcompressed || ((byte *)next_data-(byte *)psp_check_data==animation->frame_size));\n\t\t\t(void)psp_check_data;\n\t\t}\n'),
+('\t\tmatch_assert(\n\t\t\t"c:\\\\halo\\\\SOURCE\\\\models\\\\model_animations.c",\n\t\t\t820,\n\t\t\tcompressed || ((byte *)data-(byte *)animation_get_frame_data(animation, frame_index)==animation->frame_size));\n',
+ '\t\t{\n\t\t\t/* psp_fixups.py (FIXES_ASSERTSEVAL): asked for again, as the check\n\t\t\talways did (the animation cache\'s handouts, psp_anim.c), even\n\t\t\twhere asserts are compiled out */\n\t\t\tbyte *psp_check_data = compressed ? NULL : animation_get_frame_data(animation, frame_index);\n\n\t\t\tmatch_assert(\n\t\t\t\t"c:\\\\halo\\\\SOURCE\\\\models\\\\model_animations.c",\n\t\t\t\t820,\n\t\t\t\tcompressed || ((byte *)data-(byte *)psp_check_data==animation->frame_size));\n\t\t\t(void)psp_check_data;\n\t\t}\n'),
+('\t\tmatch_assert(\n\t\t\t"c:\\\\halo\\\\SOURCE\\\\models\\\\model_animations.c",\n\t\t\t821,\n\t\t\tcompressed || ((byte *)next_data-(byte *)animation_get_frame_data(animation, next_frame_index)==animation->frame_size));\n',
+ '\t\t{\n\t\t\t/* psp_fixups.py (FIXES_ASSERTSEVAL): asked for again, as the check\n\t\t\talways did (the animation cache\'s handouts, psp_anim.c), even\n\t\t\twhere asserts are compiled out */\n\t\t\tbyte *psp_check_data = compressed ? NULL : animation_get_frame_data(animation, next_frame_index);\n\n\t\t\tmatch_assert(\n\t\t\t\t"c:\\\\halo\\\\SOURCE\\\\models\\\\model_animations.c",\n\t\t\t\t821,\n\t\t\t\tcompressed || ((byte *)next_data-(byte *)psp_check_data==animation->frame_size));\n\t\t\t(void)psp_check_data;\n\t\t}\n'),
+]
+FIXES_ASSERTSEVAL["source/models/model_animations.c#killer"] = [
+(r"""		match_assert(
+			"c:\\halo\\SOURCE\\models\\model_animations.c",
+			1356,
+			++infinite_loop_killer<200);
+""",
+r"""		/* psp_fixups.py (FIXES_ASSERTSEVAL): counted outside the assert */
+		++infinite_loop_killer;
+		match_assert(
+			"c:\\halo\\SOURCE\\models\\model_animations.c",
+			1356,
+			infinite_loop_killer<200);
+"""),
+]
+
 # ---------- FIXES_RECON: recon censuses (docs/recon_134.md)
 #
 # Measuring instruments, built only with PSP_RECON=1 (psp_build.py): their
@@ -30202,7 +30692,7 @@ static struct psp_points_word psp_points_main_word;
 /* the ME's: the lowest index it has made, all above it made too */
 static struct psp_points_word psp_points_me_word;
 
-static int psp_points_on = -1, psp_points_check = 0, psp_points_min = 8;
+static int psp_points_on = -1, psp_points_check = 0, psp_points_min = 8, psp_points_slow_lines = 0, psp_points_clock_here = 0, psp_points_failed_lines = 0;
 static struct psp_point_input *psp_point_inputs; /* the list as it is made: PSP_POINTS_MAX, kept circular */
 static struct psp_point_answer *psp_point_answers;
 static unsigned char *psp_point_slots[2]; /* by kind, a slot's list index + 1, 0 none */
@@ -30214,7 +30704,42 @@ static struct
 {
 	unsigned long frames, jobs, listed, handed, taken, here, changed, unserved, compared, differed, refused, failed;
 	unsigned long me_made;
+	unsigned long slowest_us, slowest_kind, slowest_slot;
+	real longest_reach;
 } psp_points_stats;
+
+/* B31: a points job that held the ME past an audio block's 40 ms deadline
+stopped the ME for the session (three runs on the PSP). On the PSP a
+point takes at most ~80 us on the ME (measured there), so such a job
+was stuck, not slow: the job reports its slowest
+point and the failed job's point is logged, to catch it */
+static inline int psp_on_me(void)
+{
+	unsigned int sp;
+
+	__asm__ ("move %0, $sp" : "=r"(sp));
+	return (sp & 0x1FFFFFFFu) < 0x01000000u;
+}
+
+/* "mepointsclock" (the emulator): the simulated ME's points timed by the
+main CPU's clock, a system call inside the ME's work that gemesim's check
+would report, so only on asking */
+#define PSP_POINTS_CLOCK_HERE 0x40000u
+
+/* a point's time, for the slowest point's line: on the ME its cycle counter
+(which faults on the main CPU in user mode); elsewhere microseconds times
+333 with PSP_POINTS_CLOCK_HERE, else 0 */
+static inline unsigned int psp_points_clock(int on_me)
+{
+	unsigned int count;
+
+	if (on_me > 0)
+	{
+		__asm__ __volatile__("mfc0 %0, $9" : "=r"(count));
+		return count;
+	}
+	return on_me < 0 ? (unsigned int)psp_microseconds() * 333u : 0u;
+}
 
 /* point_physics_update as the ME runs it: the same arithmetic in the same
 order, with the collision rays through psp_collision_test_vector_points.
@@ -30362,7 +30887,10 @@ static long psp_point_physics_quiet(
 /* on the Media Engine (psp_me.c's ring, ME_JOB_POINTS): the list from its
 back, until the main CPU's word says it has got there. Writes only its
 answers' lines and its own word. args: the list, the answers, the count, the
-generation, the main CPU's FPU control, the two words */
+generation (PSP_POINTS_CLOCK_HERE above it), the main CPU's FPU control, the two
+words. results: made, left to the main CPU, the slowest point's time (about
+us, on the ME only) and its index, the index of the point with the longest
+first ray and that ray's length squared (a float's bits) */
 __attribute__((optimize("no-tree-loop-distribute-patterns")))
 void psp_points_me_make(const unsigned int *args, unsigned int *results)
 {
@@ -30371,7 +30899,10 @@ void psp_points_me_make(const unsigned int *args, unsigned int *results)
 	unsigned long count = args[2], generation = args[3] & 0xFFFFu, made = 0, unserved = 0;
 	struct psp_points_word *main_word = (struct psp_points_word *)args[5];
 	struct psp_points_word *me_word = (struct psp_points_word *)args[6];
-	unsigned int control;
+	int on_me = psp_on_me();
+	int clock = on_me ? 1 : (args[3] & PSP_POINTS_CLOCK_HERE) ? -1 : 0;
+	unsigned int control, slowest = 0, slowest_k = 0, longest_k = 0;
+	real longest = 0.0f;
 	long k;
 
 	__asm__ __volatile__("cfc1 %0, $31" : "=r"(control));
@@ -30392,8 +30923,25 @@ void psp_points_me_make(const unsigned int *args, unsigned int *results)
 		location.bonus = 0;
 		answer->position = in->position;
 		answer->velocity = in->velocity;
-		answer->result = psp_point_physics_quiet(in->definition, &location, &answer->position, &answer->velocity,
-			&answer->normal, &answer->material_type, &answer->collided, in->radius, in->dt);
+		{
+			real reach = (in->velocity.i * in->velocity.i + in->velocity.j * in->velocity.j +
+				in->velocity.k * in->velocity.k) * in->dt * in->dt;
+			unsigned int start = psp_points_clock(clock), took;
+
+			answer->result = psp_point_physics_quiet(in->definition, &location, &answer->position, &answer->velocity,
+				&answer->normal, &answer->material_type, &answer->collided, in->radius, in->dt);
+			took = psp_points_clock(clock) - start;
+			if (took > slowest)
+			{
+				slowest = took;
+				slowest_k = (unsigned int)k;
+			}
+			if (reach > longest)
+			{
+				longest = reach;
+				longest_k = (unsigned int)k;
+			}
+		}
 		answer->leaf_index = location.leaf_index;
 		answer->cluster_index = location.cluster_index;
 		if (answer->result < 0)
@@ -30408,6 +30956,15 @@ void psp_points_me_make(const unsigned int *args, unsigned int *results)
 	__asm__ __volatile__("ctc1 %0, $31" : : "r"(control));
 	results[0] = made;
 	results[1] = unserved;
+	results[2] = slowest / 333u;
+	results[3] = slowest_k;
+	results[4] = longest_k;
+	{
+		union { real value; unsigned int bits; } bits;
+
+		bits.value = longest;
+		results[5] = bits.bits;
+	}
 }
 
 /* 1: listing for this frame. The storage on first use; off for good if
@@ -30419,6 +30976,7 @@ int psp_points_begin(void)
 		psp_points_on = !psp_keep("nomepoints");
 		psp_points_check = psp_keep("mepointscheck");
 		psp_points_min = psp_keep_number("mepointsmin", 8);
+		psp_points_clock_here = psp_keep("mepointsclock");
 		if (psp_points_on)
 		{
 			psp_point_inputs = (struct psp_point_input *)memalign(64, PSP_POINTS_MAX * sizeof(struct psp_point_input));
@@ -30517,7 +31075,8 @@ void psp_points_hand_over(void)
 	PSP_POINTS_UNCACHED(&psp_points_main_word) = psp_points_cursor;
 	__asm__ __volatile__("sync");
 	if (psp_me_push_points(psp_point_inputs, (unsigned int)count, psp_point_answers,
-		(unsigned int)count * sizeof(struct psp_point_answer), psp_points_generation, &psp_points_main_word,
+		(unsigned int)count * sizeof(struct psp_point_answer), psp_points_generation |
+		(psp_points_clock_here ? PSP_POINTS_CLOCK_HERE : 0u), &psp_points_main_word,
 		&psp_points_me_word, &psp_points_ticket))
 	{
 		psp_points_out = 1;
@@ -30750,6 +31309,40 @@ unsigned long psp_point_physics(
 		translational_velocity, translational_force, collision_normal, collision_material_type, radius, dt);
 }
 
+/* B31: a job's slowest point on the ME and its longest first ray, kept for
+the stats line; a point slow enough to hold the ME past an audio block's
+deadline, or (on either CPU) one whose first ray is over 10 world units, is
+logged with what it was given */
+static void psp_points_note_slowest(unsigned int const *results)
+{
+	unsigned int us = results[2], slow_k = results[3], long_k = results[4];
+	union { unsigned int bits; real value; } reach;
+	struct psp_point_input const *in = NULL;
+
+	reach.bits = results[5];
+	if (slow_k < (unsigned int)psp_points_count && us > psp_points_stats.slowest_us)
+	{
+		psp_points_stats.slowest_us = us;
+		psp_points_stats.slowest_kind = (unsigned long)psp_point_inputs[slow_k].kind;
+		psp_points_stats.slowest_slot = (unsigned long)psp_point_inputs[slow_k].slot;
+	}
+	if (long_k < (unsigned int)psp_points_count && reach.value > psp_points_stats.longest_reach)
+		psp_points_stats.longest_reach = reach.value;
+	if (us >= 5000u && slow_k < (unsigned int)psp_points_count)
+		in = &psp_point_inputs[slow_k];
+	else if (reach.value > 100.0f && long_k < (unsigned int)psp_points_count)
+		in = &psp_point_inputs[long_k];
+	if (in && psp_points_slow_lines < 12)
+	{
+		psp_points_slow_lines++;
+		platform_psp_log("mepoints: a point %s (the job's slowest about %u us, its longest first ray %.2f world units): "
+			"kind %d slot %ld definition %p leaf %ld cluster %d position %.3f %.3f %.3f velocity %.3f %.3f %.3f radius %.4f dt %.4f",
+			us >= 5000u ? "slow" : "with a long ray", us, sqrt(reach.value), in->kind, in->slot,
+			(void const *)in->definition, in->leaf_index, in->cluster_index, in->position.x, in->position.y,
+			in->position.z, in->velocity.i, in->velocity.j, in->velocity.k, in->radius, in->dt);
+	}
+}
+
 /* the frame's points done: the ME stopped and its job collected, so the
 list may be written again */
 void psp_points_end(void)
@@ -30763,7 +31356,37 @@ void psp_points_end(void)
 		PSP_POINTS_UNCACHED(&psp_points_main_word) = ((unsigned long)psp_points_generation << 16) | 0xFFFFu;
 		__asm__ __volatile__("sync");
 		if (psp_me_wait(psp_points_ticket, results))
+		{
 			psp_points_stats.me_made += results[0];
+			if (results[0])
+				psp_points_note_slowest(results);
+		}
+		else if (psp_points_failed_lines < 4)
+		{
+			/* B31: the point the ME was on when the job failed (the one below
+			the last it made), with what it was given: replayed in the
+			emulator, it says whether that point is slow or the ME faulted */
+			unsigned long made = PSP_POINTS_UNCACHED(&psp_points_me_word);
+			long k = (made >> 16) == psp_points_generation ? (long)(made & 0xFFFFu) - 1 : psp_points_count - 1;
+
+			psp_points_failed_lines++;
+			psp_points_stats.failed++;
+			if (k >= 0 && k < psp_points_count)
+			{
+				struct psp_point_input const *in = &psp_point_inputs[k];
+
+				platform_psp_log("mepoints: the job failed %s point %ld of %d (the ME's word %08lx): kind %d slot %ld definition %p "
+					"leaf %ld cluster %d position %08lx %08lx %08lx velocity %08lx %08lx %08lx radius %08lx dt %08lx",
+					(made >> 16) == psp_points_generation ? "at" : "with none made, not begun or on its first,", k,
+					psp_points_count, made, in->kind, in->slot, (void const *)in->definition, in->leaf_index, in->cluster_index,
+					PSP_POINTS_BITS(in->position.x), PSP_POINTS_BITS(in->position.y), PSP_POINTS_BITS(in->position.z),
+					PSP_POINTS_BITS(in->velocity.i), PSP_POINTS_BITS(in->velocity.j), PSP_POINTS_BITS(in->velocity.k),
+					PSP_POINTS_BITS(in->radius), PSP_POINTS_BITS(in->dt));
+			}
+			else
+				platform_psp_log("mepoints: the job failed before its first point (the ME's word %08lx, %d points)", made,
+					psp_points_count);
+		}
 		else
 			psp_points_stats.failed++;
 		psp_points_out = 0;
@@ -30785,11 +31408,13 @@ void psp_points_end(void)
 			mark = now;
 			platform_psp_log("mepoints: over %lu frames, %lu points listed a frame; %lu hand-overs (%lu refused, %lu failed) of %lu points: "
 				"the ME made %lu, the loops took %lu of them, made %lu here first, %lu changed since listed, %lu left to this CPU; "
-				"checked %lu, %lu differed",
+				"checked %lu, %lu differed; the slowest point the ME made about %lu us (kind %lu slot %lu), the longest first ray "
+				"%.2f world units",
 				psp_points_stats.frames, psp_points_stats.listed / frames, psp_points_stats.jobs, psp_points_stats.refused,
 				psp_points_stats.failed, psp_points_stats.handed, psp_points_stats.me_made, psp_points_stats.taken,
 				psp_points_stats.here, psp_points_stats.changed, psp_points_stats.unserved, psp_points_stats.compared,
-				psp_points_stats.differed);
+				psp_points_stats.differed, psp_points_stats.slowest_us, psp_points_stats.slowest_kind,
+				psp_points_stats.slowest_slot, sqrt(psp_points_stats.longest_reach));
 			memset(&psp_points_stats, 0, sizeof(psp_points_stats));
 		}
 	}
@@ -31159,15 +31784,21 @@ FIXES_MODELS["source/rasterizer/rasterizer.c#lightgel"] = [
 				unsigned int average = 0;
 				int gel_known = gel != NONE && psp_tex_average_known(psp_tex_bitmap_key(gel, 0), &average);
 				int gel_faced = 0;
-				/* the six faces' colours, then the gel's forward, left and up */
-				float gel_shape[27];
+				unsigned int gel_cube_key = 0;
+				/* the six faces' colours, the gel's forward, left and up, then
+				its cube's key (0: none, the faces shape it) */
+				float gel_shape[28];
 
 				if (gel_known && *(float const *)(definition + 32) <= -0.99f && !PSP_KEEP_ONCE("nogel"))
 				{
 					extern int psp_tex_gel_faces(unsigned int key, float *faces);
 
+					extern const void *psp_tex_gel_cube(unsigned int key);
+
 					if (PSP_KEEP_ONCE("gelfaces") && psp_tex_gel_faces(psp_tex_bitmap_key(gel, 0), gel_shape))
 						gel_faced = psp_light_gel_frame(light, gel_shape + 18);
+					if (gel_faced && !PSP_KEEP_ONCE("nogelcube") && psp_tex_gel_cube(psp_tex_bitmap_key(gel, 0)))
+						gel_cube_key = psp_tex_bitmap_key(gel, 0);
 					if (!gel_faced)
 					{
 						colour.red *= (float)(average & 0xFF) / 255.0f;
@@ -31189,8 +31820,9 @@ FIXES_MODELS["source/rasterizer/rasterizer.c#lightgel"] = [
 						definition ? *(float const *)(definition + 28) : -1.0f,
 						definition ? *(float const *)(definition + 32) : -1.0f);
 					if (gel_faced)
-						platform_log("lightdump: light %ld's gel faces %.2f %.2f %.2f / %.2f %.2f %.2f / %.2f %.2f %.2f / %.2f %.2f %.2f / %.2f %.2f %.2f / %.2f %.2f %.2f forward %.2f %.2f %.2f up %.2f %.2f %.2f",
-							light_index, gel_shape[0], gel_shape[1], gel_shape[2], gel_shape[3], gel_shape[4], gel_shape[5],
+						platform_log("lightdump: light %ld's gel %s, faces %.2f %.2f %.2f / %.2f %.2f %.2f / %.2f %.2f %.2f / %.2f %.2f %.2f / %.2f %.2f %.2f / %.2f %.2f %.2f forward %.2f %.2f %.2f up %.2f %.2f %.2f",
+							light_index, gel_cube_key ? "sampled from its cube" : "by its faces' means",
+							gel_shape[0], gel_shape[1], gel_shape[2], gel_shape[3], gel_shape[4], gel_shape[5],
 							gel_shape[6], gel_shape[7], gel_shape[8], gel_shape[9], gel_shape[10], gel_shape[11],
 							gel_shape[12], gel_shape[13], gel_shape[14], gel_shape[15], gel_shape[16], gel_shape[17],
 							gel_shape[18], gel_shape[19], gel_shape[20], gel_shape[24], gel_shape[25], gel_shape[26]);
@@ -31205,6 +31837,7 @@ FIXES_MODELS["source/rasterizer/rasterizer.c#lightgel"] = [
 				{
 					extern void psp_ge_light_gel(const float *gel);
 
+					memcpy(gel_shape + 27, &gel_cube_key, sizeof(gel_cube_key));
 					psp_ge_light_gel(gel_faced ? gel_shape : NULL);
 				}"""),
 ]
@@ -32463,6 +33096,48 @@ FIXES_SOUNDEDRAM["source/cache/physical_memory_map.c#soundedram"] = [
 #endif"""),
 ]
 FIXES_SOUNDEDRAM["source/cache/xbox_sound_cache.c#soundedram"] = [
+# "soundnoyield" (research, 2026-10-26: why SNDEDRAM cost d20's opening
+# +11-14% a frame): a request for a sound not yet loaded yields the thread
+# (SwitchToThread, sched_yield) even when the caller doesn't wait for it.
+# prioritize_sounds asks every sound that isn't playing, every frame, so a
+# load queue that drains slowly (the eDRAM path: two 60 KB pieces in flight,
+# moved on once a frame) means as many yields a frame as sounds waiting:
+# 'sound_render: prioritise' went 0.1-0.7 -> 3-30 ms a frame over d20's
+# opening (40096390859). Only a blocking request yields ("soundyieldold":
+# every one, as before); the answer is the same either way (not loaded yet),
+# and the yield costs ~1.36 ms on the PSP, ~950 times in d20's opening. The
+# counts are always
+# kept and logged with the sound cache's line
+("""			else
+			{
+				SwitchToThread();
+			}
+		}
+		while (!result && block);""",
+ """			else
+			{
+#ifdef HALO_PSP
+				extern int psp_sound_noyield(void);
+				extern unsigned long psp_sound_request_yields, psp_sound_request_yield_us, psp_sound_request_unyielded;
+				extern unsigned int sceKernelGetSystemTimeLow(void);
+
+				if (block || !psp_sound_noyield())
+				{
+					unsigned int psp_began = sceKernelGetSystemTimeLow();
+
+					SwitchToThread();
+					psp_sound_request_yields++;
+					psp_sound_request_yield_us += sceKernelGetSystemTimeLow() - psp_began;
+				}
+				else
+					psp_sound_request_unyielded++;
+#else
+				SwitchToThread();
+#endif
+			}
+		}
+		while (!result && block);"""),
+
 ("""		cache_sound->sound = sound;
 		cache_file_read(
 			sound->cache_tag_index,
@@ -32539,6 +33214,11 @@ void sound_cache_idle(
 		extern void psp_sound_upload_report(void);
 
 		psp_sound_upload_report();
+	}
+	{
+		extern void psp_sound_request_report(void);
+
+		psp_sound_request_report();
 	}
 }"""),
 ]
@@ -35304,7 +35984,87 @@ FIXES_DGFAST["source/memory/data.c#dgfast"] = [
 
 
 
-for rel, pairs in shelved(list(FIXES_19.items()) + list(FIXES_19_SKY.items()) + list(FIXES_22.items()) + list(FIXES_23.items()) + list(FIXES_31.items()) + list(FIXES_36.items()) + list(FIXES_105.items()) + list(FIXES_106.items()) + list(FIXES_107.items()) + list(FIXES_108.items()) + list(FIXES_109.items()) + list(FIXES_110.items()) + list(FIXES_112.items()) + list(FIXES_113.items()) + list(FIXES_114.items()) + list(FIXES_115.items()) + list(FIXES_116.items()) + list(FIXES_118.items()) + list(FIXES_119.items()) + list(FIXES_CHUPA.items()) + list(FIXES_MULTIPLAYER.items()) + list(FIXES_MPCLIENT.items()) + list(FIXES_PACKET_ALIGNMENT.items()) + list(FIXES_INTERNET.items()) + list(FIXES_121.items()) + list(FIXES_122.items()) + list(FIXES_123.items()) + list(FIXES_123L.items()) + list(FIXES_126.items()) + list(FIXES_128.items()) + list(FIXES_129.items()) + list(FIXES_130.items()) + list(FIXES_131.items()) + list(FIXES_132.items()) + list(FIXES_133.items()) + list(FIXES_134.items()) + list(FIXES_135.items()) + list(FIXES_136.items()) + list(FIXES_137.items()) + list(FIXES_WAKE.items()) + list(FIXES_DRIVE.items()) + list(FIXES_FRONT.items()) + list(FIXES_CONTROLS.items()) + list(FIXES_MENUS.items()) + list(FIXES_LOADING.items()) + list(FIXES_STENCILS.items()) + list(FIXES_POOLS.items()) + list(FIXES_CAMPAIGNNET.items()) + list(FIXES_LD1.items()) + list(FIXES_DRAWCOLD.items()) + list(FIXES_SOUND.items()) + list(FIXES_BONUS.items()) + list(FIXES_GEFEED.items()) + list(FIXES_WS.items()) + list(FIXES_CACHE.items()) + list(FIXES_NMSKIP.items()) + list(FIXES_OBJWALK.items()) + list(FIXES_SOUNDEDRAM.items()) + list(FIXES_MEJOBS.items()) + list(FIXES_OCEAN.items()) + list(FIXES_VITA.items()) + list(FIXES_RSO.items()) + list(FIXES_LFS.items()) + list(FIXES_DECALFADE.items()) + list(FIXES_MODELS.items()) + list(FIXES_PRS.items()) + list(FIXES_LODPSP.items()) + list(FIXES_AICAD.items()) + list(FIXES_VEHPROBE.items()) + list(FIXES_AIMCACHE.items()) + list(FIXES_PROFWAIT.items()) + list(FIXES_LOOKREAL.items()) + list(FIXES_BSPR.items()) + list(FIXES_MIRRORPASS.items()) + list(FIXES_HANDLES.items()) + list(FIXES_LIGHTPLAN.items()) + list(FIXES_HOIST.items()) + list(FIXES_UNITHOIST.items()) + list(FIXES_TAGSNAP.items()) + list(FIXES_DGFAST.items()) + (list(FIXES_RECON.items()) if os.environ.get("PSP_RECON", "") == "1" else [])):
+# B30 (a restoration): doors lit bright where the
+# level around them is black. An object's lighting is sampled from the
+# lightmap under it, and on the PSP that read uses the renderer's copies of
+# the floor, there only for floor already drawn: seen from a lit room, a door's
+# dark-side floor isn't, the sample answered white, and machines (unlike units
+# and items) never sample again, so the door stayed bright (api-job door-light
+# 40361599823). A sample with nothing real to go on now counts as no sample,
+# and an object with such a miss is sampled again at the engine's refresh
+# interval until a clean one lands. "lightoldmiss": as before.
+FIXES_B30 = {}
+FIXES_B30["source/objects/object_lights.c#b30"] = [
+("""						sample_diffuse_texture(
+							material,
+							diffuse_bitmap,""",
+"""#ifdef HALO_PSP
+						psp_light_miss = 0;
+#endif
+						sample_diffuse_texture(
+							material,
+							diffuse_bitmap,"""),
+("""						result = TRUE;""",
+"""#ifdef HALO_PSP
+						/* psp_fixups.py (FIXES_B30): a read with nothing real behind it isn't a sample */
+						if (psp_light_miss && !PSP_KEEP_ONCE("lightoldmiss"))
+							psp_light_object_missed = 1;
+						else
+#endif
+						result = TRUE;"""),
+]
+FIXES_B30["source/render/render_objects.c#b30"] = [
+("""	if (TEST_FLAG(object_get(object_index)->object.flags, _object_static_lighting_recompute_bit))
+	{
+		if (level_of_detail_pixels > OBJECT_RENDER_STATE_LARGE_PIXELS)""",
+"""#ifdef HALO_PSP
+	if (TEST_FLAG(object_get(object_index)->object.flags, _object_static_lighting_recompute_bit) ||
+		psp_light_pending(object_index))
+#else
+	if (TEST_FLAG(object_get(object_index)->object.flags, _object_static_lighting_recompute_bit))
+#endif
+	{
+		if (level_of_detail_pixels > OBJECT_RENDER_STATE_LARGE_PIXELS)"""),
+("""		lights_prepare_for_object_static(object_index, &state->desired_lighting);""",
+"""#ifdef HALO_PSP
+		psp_light_object_missed = 0;
+#endif
+		lights_prepare_for_object_static(object_index, &state->desired_lighting);
+#ifdef HALO_PSP
+		psp_light_pending_set(object_index, psp_light_object_missed);
+#endif"""),
+("""void render_objects(""",
+"""#ifdef HALO_PSP
+/* psp_fixups.py (FIXES_B30): objects whose last lighting sample missed, by
+absolute index; sampled again at the recompute interval until clean */
+extern int psp_light_object_missed;
+static unsigned char psp_light_pending_bits[4096 / 8];
+unsigned long psp_light_retries = 0;
+
+static boolean psp_light_pending(long object_index)
+{
+	unsigned int index = (unsigned int)object_index & 4095;
+
+	return (psp_light_pending_bits[index >> 3] >> (index & 7)) & 1;
+}
+
+static void psp_light_pending_set(long object_index, int missed)
+{
+	unsigned int index = (unsigned int)object_index & 4095;
+
+	if (psp_light_pending(object_index))
+		psp_light_retries++;
+	if (missed)
+		psp_light_pending_bits[index >> 3] |= (unsigned char)(1 << (index & 7));
+	else
+		psp_light_pending_bits[index >> 3] &= (unsigned char)~(1 << (index & 7));
+}
+#endif
+
+void render_objects("""),
+]
+
+for rel, pairs in shelved(list(FIXES_19.items()) + list(FIXES_19_SKY.items()) + list(FIXES_22.items()) + list(FIXES_23.items()) + list(FIXES_31.items()) + list(FIXES_36.items()) + list(FIXES_105.items()) + list(FIXES_106.items()) + list(FIXES_107.items()) + list(FIXES_108.items()) + list(FIXES_109.items()) + list(FIXES_110.items()) + list(FIXES_112.items()) + list(FIXES_113.items()) + list(FIXES_114.items()) + list(FIXES_115.items()) + list(FIXES_116.items()) + list(FIXES_118.items()) + list(FIXES_119.items()) + list(FIXES_CHUPA.items()) + list(FIXES_MULTIPLAYER.items()) + list(FIXES_MPCLIENT.items()) + list(FIXES_PACKET_ALIGNMENT.items()) + list(FIXES_INTERNET.items()) + list(FIXES_121.items()) + list(FIXES_122.items()) + list(FIXES_123.items()) + list(FIXES_123L.items()) + list(FIXES_126.items()) + list(FIXES_128.items()) + list(FIXES_129.items()) + list(FIXES_130.items()) + list(FIXES_131.items()) + list(FIXES_132.items()) + list(FIXES_133.items()) + list(FIXES_134.items()) + list(FIXES_135.items()) + list(FIXES_136.items()) + list(FIXES_137.items()) + list(FIXES_WAKE.items()) + list(FIXES_DRIVE.items()) + list(FIXES_FRONT.items()) + list(FIXES_CONTROLS.items()) + list(FIXES_MENUS.items()) + list(FIXES_LOADING.items()) + list(FIXES_STENCILS.items()) + list(FIXES_POOLS.items()) + list(FIXES_CAMPAIGNNET.items()) + list(FIXES_LD1.items()) + list(FIXES_DRAWCOLD.items()) + list(FIXES_SOUND.items()) + list(FIXES_BONUS.items()) + list(FIXES_GEFEED.items()) + list(FIXES_WS.items()) + list(FIXES_CACHE.items()) + list(FIXES_NMSKIP.items()) + list(FIXES_OBJWALK.items()) + list(FIXES_SOUNDEDRAM.items()) + list(FIXES_MEJOBS.items()) + list(FIXES_OCEAN.items()) + list(FIXES_VITA.items()) + list(FIXES_RSO.items()) + list(FIXES_LFS.items()) + list(FIXES_DECALFADE.items()) + list(FIXES_MODELS.items()) + list(FIXES_PRS.items()) + list(FIXES_LODPSP.items()) + list(FIXES_AICAD.items()) + list(FIXES_VEHPROBE.items()) + list(FIXES_AIMCACHE.items()) + list(FIXES_PROFWAIT.items()) + list(FIXES_LOOKREAL.items()) + list(FIXES_BSPR.items()) + list(FIXES_MIRRORPASS.items()) + list(FIXES_HANDLES.items()) + list(FIXES_LIGHTPLAN.items()) + list(FIXES_HOIST.items()) + list(FIXES_UNITHOIST.items()) + list(FIXES_TAGSNAP.items()) + list(FIXES_DGFAST.items()) + list(FIXES_COMPACTSKIP.items()) + list(FIXES_GCHEAD.items()) + list(FIXES_SMALLWINS2.items()) + list(FIXES_ASSERTSEVAL.items()) + list(FIXES_B30.items()) + (list(FIXES_RECON.items()) if os.environ.get("PSP_RECON", "") == "1" else [])):
     FIXES.setdefault(rel.split('#')[0], []).extend(pairs)
 
 

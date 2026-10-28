@@ -248,12 +248,13 @@ void psp_debug_draw(void *vram)
 		}
 	}
 	{
-		/* build 105: a full heap shows on screen whether or not the overlay is
-		on (b104 run 1 failed allocations from the moment it loaded, and it
-		showed only when the controls died) */
+		/* a full heap shows with the overlay, which a test build starts with:
+		allocations that fail from the moment a map loads would otherwise
+		show only when the controls died. A release starts without the
+		overlay, and a player gets no warning to act on; the log has it */
 		extern volatile unsigned long psp_heap_failures;
 
-		heap_warning = psp_heap_failures > 0;
+		heap_warning = psp_heap_failures > 0 && overlay;
 	}
 	if (!menu_open && !overlay && !heap_warning)
 		return;

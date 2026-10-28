@@ -1,20 +1,20 @@
 # Halo PSP launch presets: one a line, "name: keep words" (no colon in the name). The launch menu's
 # third page (R from the options) lists them; cross applies one. Build 136's tests
 # (docs/build_b136.md says what each answers and when to stop).
-1 play, b136 as it ships: nearauto assettrack geo2
-2 ladder, every opening 90 s, frames timed: nearauto assettrack geo2 gebusy iostats ladder90 frametrace
-3 cinematic bench, stops by itself: nearauto assettrack geo2 gebusy exitat70
-4 play, the speed-ups off (b121 to b136): nearauto assettrack geo2 percold surfacetestold machinesawake meslantoff meraysoff posingold animlockcall aiprofilefull weapontrackawake pathclearfull deletedwalkall aipathold logeachline obscurertest nearautofull flaresfull fractiondouble cutlessoff surfaceboundoff poseaheadoff wakeonwriteoff
-5 play, b125's fixes off (as b124, ME restart aside): nearauto assettrack geo2 levellocaloff streamroomoff seethroughpush seethroughwrap waterunfogged meresetwhole
-6 dither A/B, half strength: nearauto assettrack geo2 ditherhalf
-7 dither A/B, off: nearauto assettrack geo2 nodither
-8 level drawn as b124 (no shared origin): nearauto assettrack geo2 levellocaloff
-9 sleep, ME restarted after the wake (exit last): nearauto assettrack geo2 mewake
-10 level materials as b124 (no waiting list): nearauto assettrack geo2 streamroomoff
-11 b126's restorations off (HUD state, aiming): nearauto assettrack geo2 weaponstateold aimchangeold
-12 play, stick reads logged: nearauto assettrack geo2 iostats
-13 showcase, the openings' cutscenes one after another: nearauto assettrack geo2 sceneladder
-14 play, frames timed: nearauto assettrack geo2 frametrace
-15 sleep, ME never started (exit last): nearauto assettrack geo2 nomeaudio
-16 dither A/B, detail and sky passes dithered, the pattern moved: nearauto assettrack geo2 dithershift ditherprobe
-17 dither A/B, as 16 with the offsets lifted: nearauto assettrack geo2 dithershift ditherlift ditherprobe
+1 play, b136 as it ships: nearauto assettrack geo15
+2 ladder, every opening 90 s, frames timed: nearauto assettrack geo15 gebusy iostats ladder90 frametrace
+3 cinematic bench, stops by itself: nearauto assettrack geo15 gebusy exitat70
+4 play, the speed-ups off (b121 to b136): nearauto assettrack geo15 percold surfacetestold machinesawake meslantoff meraysoff posingold animlockcall aiprofilefull weapontrackawake pathclearfull deletedwalkall aipathold logeachline obscurertest nearautofull flaresfull fractiondouble cutlessoff surfaceboundoff poseaheadoff wakeonwriteoff
+5 play, b125's fixes off (as b124, ME restart aside): nearauto assettrack geo15 levellocaloff streamroomoff seethroughpush seethroughwrap waterunfogged meresetwhole
+6 dither A/B, half strength: nearauto assettrack geo15 ditherhalf
+7 dither A/B, off: nearauto assettrack geo15 nodither
+8 level drawn as b124 (no shared origin): nearauto assettrack geo15 levellocaloff
+9 sleep, ME restarted after the wake (exit last): nearauto assettrack geo15 mewake
+10 level materials as b124 (no waiting list): nearauto assettrack geo15 streamroomoff
+11 b126's restorations off (HUD state, aiming): nearauto assettrack geo15 weaponstateold aimchangeold
+12 play, stick reads logged: nearauto assettrack geo15 iostats
+13 showcase, the openings' cutscenes one after another: nearauto assettrack geo15 sceneladder
+14 play, frames timed: nearauto assettrack geo15 frametrace
+15 sleep, ME never started (exit last): nearauto assettrack geo15 nomeaudio
+16 dither A/B, detail and sky passes dithered, the pattern moved: nearauto assettrack geo15 dithershift ditherprobe
+17 dither A/B, as 16 with the offsets lifted: nearauto assettrack geo15 dithershift ditherlift ditherprobe

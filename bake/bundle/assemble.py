@@ -132,7 +132,7 @@ def assemble(tools, out, target):
         shutil.rmtree(out)
     os.makedirs(out)
     bake = os.path.join(REPO, 'bake')
-    for name in ('bake.py', 'guided.py', 'xiso.py', 'launcher.py', 'requirements.txt', 'hashes.json', 'README.md',
+    for name in ('bake.py', 'guided.py', 'xiso.py', 'launcher.py', 'requirements.txt', 'hashes.json', 'tested_images.json', 'README.md',
                  'INVADER.md'):
         copy(os.path.join(bake, name), os.path.join(out, name))
     # which bundle this is, for the stamp each bake writes (bake.py's bundle_label)

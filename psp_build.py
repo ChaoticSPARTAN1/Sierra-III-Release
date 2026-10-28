@@ -273,9 +273,14 @@ PSP = ["psp-gcc", "-G0", GAME_OPT, "-march=allegrex", "-ffp-contract=off", "-fsh
        "-ffunction-sections", "-fdata-sections", "-fno-math-errno", "-fsingle-precision-constant",
        "-DHALO_PSP=1", "-DHALO_RELEASE=1", "-DHALO_ANDROID=1",
        ] + (["-DPSP_MULTIPLAYER=1"] if MULTIPLAYER else []) + (["-DPSP_MP_COOP=1"] if MULTIPLAYER and MP_COOP else []) + (["-DPSP_MP_HOST=1"] if MULTIPLAYER and MP_HOST else []) + (["-DPSP_MAP_CHECKS=1"] if MAP_CHECKS else []) + (["-DPSP_POOLS_XBOX=1"] if POOLS_XBOX else []) + (["-DPSP_RECON_64MB=1"] if BIG_RAM else []) + (["-DPSP_DEBUG_TOOLS=1"] if DEBUG_TOOLS else []) + (["-DPSP_TICK_STEPS=1"] if TICK_STEPS else []) + (["-DPSP_RECON=1"] if RECON else []) + (["-DPSP_METRICS=1"] if METRICS else []) + (["-DPSP_PGO_GENERATE=1"] if PGO == "generate" else []) + os.environ.get("PSP_CFLAGS", "").split() + [
-       # build 19: failed asserts are cold paths, laid out away from the hot
-       # code (the 16 KB instruction cache holds more of what runs)
+       # The fatal asserts are compiled out, unevaluated (X10): their checks
+       # and messages fill the 16 KB instruction cache, so with them gone b30's
+       # tick is 6.6% shorter on the PSP-3000 [M], and play is identical. The
+       # asserts that do the game's work are evaluated outside their checks
+       # (psp_fixups.py's FIXES_ASSERTSEVAL). PSP_ASSERTS_ON=1 keeps them,
+       # as cold paths laid out away from the hot code
        "-DPSP_ASSERTS_COLD=1", "-freorder-blocks-and-partition", "-mno-explicit-relocs",
+       ] + ([] if os.environ.get("PSP_ASSERTS_ON", "") == "1" else ["-DPSP_ASSERTS_OFF=1"]) + [
        # the port's own sources are compiled by full path, and __FILE__ (asserts)
        # would put that path in the EBOOT: written relative to the checkout, the
        # same commit builds the same bytes on any machine
@@ -410,6 +415,12 @@ def cold_code(rel):
 # than folding them into their caller. Slower; never for play
 NOINLINE_UNITS = [w for w in os.environ.get("PSP_NOINLINE", "").split(",") if w]
 
+# PSP_ASSERTS_OFF_UNITS=ai,objects (recon only): the units under a
+# directory of one of these names are compiled with PSP_ASSERTS_OFF (the fatal
+# asserts compiled out, unevaluated), the rest as usual: a bisection for the
+# assert whose expression does the game's work (X10, assertsoff1-4)
+ASSERTS_OFF_UNITS = [w for w in os.environ.get("PSP_ASSERTS_OFF_UNITS", "").split(",") if w]
+
 def compile_one(item):
     src, flags, extra = item
     rel = os.path.relpath(src, HERE) if src.startswith("/") else src
@@ -420,6 +431,8 @@ def compile_one(item):
         extra = extra + pgo_flags(rel)
     if any(word in rel for word in NOINLINE_UNITS):
         extra = extra + ["-fno-inline", "-fno-inline-small-functions", "-fno-inline-functions-called-once"]
+    if any(("/%s/" % word) in ("/" + rel.replace("\\", "/")) for word in ASSERTS_OFF_UNITS):
+        extra = extra + ["-DPSP_ASSERTS_OFF=1"]
     os.makedirs(os.path.dirname(obj), exist_ok=True)
     defines = ["-Dmain=halo_main"] if src.endswith("shell/shell_xbox.c") else []
     if src.endswith("psp_bakecheck.c"):
@@ -683,6 +696,37 @@ def link(objs, stubs):
                         "".join("   %s(.bss .bss.* COMMON)\n" % o for o in me_objects) +
                         "   . = ALIGN(64);\n   __psp_me_bss_end = .;\n"
                         "   *(.bss .bss.* .gnu.linkonce.b.*)\n")
+    # pspgu's and pspgum's small variables (gu_list, gu_states,
+    # gu_curr_context, gum_vfpucontext, ...: the SDK builds them -G8, so they
+    # sit in .sbss, out of the block above) are the ME's too. Left where the
+    # linker puts them they share 64-byte lines with pspdebug's screen state
+    # and libgcc's emutls words, which the main CPU writes while the ME draws:
+    # the emulator's model of the two caches (mecohere) caught the ME's
+    # gu_list and gu_states write lost under the main CPU's dirty line. They
+    # go last in .sbss, on the one line just below the ME's .bss block, with
+    # pspdebug's and emutls' words moved below the other small variables: the
+    # ME's block starts 64-byte aligned, so as long as .sbss ends inside the
+    # same line as before nothing after it moves (padding them out instead
+    # moved all of .bss ~190 bytes, and the PSP's tick paid for the new cache
+    # sets), and they stay in $gp's reach. gum_current_matrix (.sdata) stays
+    # first in .sdata, its line shared only with libc's start-up words.
+    # PSP_GU_PLACE=sdk leaves them where the SDK's script puts them: the other
+    # side of the placement's A/B, from the same commit
+    me_small = ("*libpspgu.a:*", "*libpspgum.a:*")
+    main_busy = ("*libpspdebug.a:*", "*libgcc.a:emutls.o")
+    sbss = [] if os.environ.get("PSP_GU_PLACE") == "sdk" else re.findall(r"\n([ \t]*)\*\(\.sbss \.sbss\.\* \.gnu\.linkonce\.sb\.\*\)\n([ \t]*)\*\(\.scommon\)", text)
+    if len(sbss) != 1 and os.environ.get("PSP_GU_PLACE") != "sdk":
+        sys.exit("psp_build: the SDK's linkfile.prx has changed; pspgu's small variables can't be placed")
+    if sbss:
+        ind = sbss[0][0]
+        text = text.replace("\n%s*(.sbss .sbss.* .gnu.linkonce.sb.*)\n%s*(.scommon)" % sbss[0],
+                            "\n%s*(EXCLUDE_FILE(%s) .sbss .sbss.* .gnu.linkonce.sb.*)\n%s*(.scommon)\n" %
+                            (ind, " ".join(me_small + main_busy), sbss[0][1]) +
+                            "".join("%s%s(.sbss .sbss.*)\n" % (ind, o) for o in main_busy) +
+                            "%s. = ALIGN(64);\n%s__psp_me_small_start = .;\n" % (ind, ind) +
+                            "".join("%s%s(.sbss .sbss.*)\n" % (ind, o) for o in me_small) +
+                            "%s__psp_me_small_end = .;\n" % ind +
+                            "%sASSERT(__psp_me_small_end - __psp_me_small_start <= 64, \"pspgu's small variables outgrew their line\");" % ind)
     linkfile = os.path.join(OUT, "linkfile_layout.prx")
     open(linkfile, "w").write(text)
     # build 107: the link map (halo.map: each function's and variable's

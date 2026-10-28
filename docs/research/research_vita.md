@@ -13,6 +13,8 @@ Labels: [M] measured on a PSP, [E] emulator or estimate, [D] read in code or dat
 
 Anything taken still names the Vita port in its commit and review. The exchange is kept in the project's private research notes. His words: "Dude steal away I want to try your port sometime!"
 
+**Extended (2026-10-27):** BirchWoodGod and this project's author are collaborating on both projects. Sierra-III may use what he wrote in either of his ports, halo-ce-vita and project-ark-dev (Project Ark), and he may use what we wrote. The limits above still apply to both: nothing generated from Invader, nothing he credits to others (iamhaller, Bruno Santana), and OpenCE after `4b09168e` and halo-ce-universal are AGPL, so ideas only from them. The credit rule is unchanged: a change taken from either port names it and him in its commit, its review and the README's Credits.
+
 **Where to read it.** `port/vita/README.md` (settings, the profiles' costs, debug switches), `ROADMAP.md` and the main README's Performance section. Engine changes carry `/* port: */` or `/* (port) */` comments under `#ifdef HALO_LINUX` (the Vita builds the Linux platform layer); the speed ones name their map and their measurement.
 
 ## The short answer

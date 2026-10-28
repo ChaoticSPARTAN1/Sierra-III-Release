@@ -632,6 +632,11 @@ running count */
 volatile unsigned long psp_heap_failures = 0;
 #define HEAP_FAILURES_LOGGED 64
 
+/* requests asked through psp_heap_try_memalign whose callers have somewhere
+else to go (psp_ge.c's level copies wait for the carve): a refusal there is
+counted apart, so the overlay's HEAP FULL means a request nothing caught */
+volatile unsigned long psp_heap_refusals = 0;
+
 static void heap_map_tag(void *pointer, size_t size, const char *kind, void *caller); /* below */
 void psp_heap_map(const char *label); /* below */
 static struct heap_map_space *heap_map; /* below */
@@ -677,8 +682,8 @@ void psp_heap_line(char *line, int size)
 {
 	struct mallinfo info = mallinfo();
 
-	snprintf(line, size, "heap: %d KB in use, %d KB free inside in %d pieces, %d KB taken from the system; %lu requests failed",
-		info.uordblks / 1024, info.fordblks / 1024, info.ordblks, info.arena / 1024, psp_heap_failures);
+	snprintf(line, size, "heap: %d KB in use, %d KB free inside in %d pieces, %d KB taken from the system; %lu requests failed, %lu refused with a fallback",
+		info.uordblks / 1024, info.fordblks / 1024, info.ordblks, info.arena / 1024, psp_heap_failures, psp_heap_refusals);
 }
 
 /* work marked as the Media Engine's in the emulator (gemesim's psp_me_context)
@@ -720,6 +725,29 @@ void *__wrap_malloc(size_t size) { heap_me_check(__builtin_return_address(0), si
 void *__wrap_calloc(size_t count, size_t size) { heap_me_check(__builtin_return_address(0), count * size, "calloc"); return heap_note(__real_calloc(count, size), count * size, "calloc", __builtin_return_address(0)); }
 void *__wrap_realloc(void *pointer, size_t size) { heap_me_check(__builtin_return_address(0), size, "realloc"); return heap_note(__real_realloc(pointer, size), size, "realloc", __builtin_return_address(0)); }
 void *__wrap_memalign(size_t alignment, size_t size) { heap_me_check(__builtin_return_address(0), size, "memalign"); return heap_note(__real_memalign(alignment, size), size, "memalign", __builtin_return_address(0)); }
+
+/* memalign for a caller that copes with a refusal. A success is booked as
+memalign's (callers, the map, the large total); a refusal only adds to
+psp_heap_refusals. "heapcountall" books refusals as failures again, as
+before this existed */
+static int heap_count_all = -1;
+
+void *psp_heap_try_memalign(size_t alignment, size_t size)
+{
+	extern int psp_keep(const char *name);
+	extern int psp_keep_loaded(void);
+	void *caller = __builtin_return_address(0);
+	void *result;
+
+	heap_me_check(caller, size, "memalign");
+	result = __real_memalign(alignment, size);
+	if (heap_count_all < 0 && psp_keep_loaded())
+		heap_count_all = psp_keep("heapcountall");
+	if (result || heap_count_all > 0)
+		return heap_note(result, size, "memalign", caller);
+	psp_heap_refusals++;
+	return NULL;
+}
 
 /* ---------- the heap's map ("heapmap", keep.txt)
 

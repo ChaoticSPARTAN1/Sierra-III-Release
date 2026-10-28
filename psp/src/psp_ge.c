@@ -240,7 +240,7 @@ instruction cache longer. The ME step moves the carrying out to the ME. Off
 #define SCREEN_VERTEX_WORDS 5 /* struct game_screen_vertex: x, y, u, v, argb */
 #define SPRITE_VERTEX_WORDS 6 /* struct game_sprite_vertex: x, y, z, u, v, argb */
 #define METER_WORDS 7 /* struct psp_seethrough_meter (the game's rasterizer_meter_parameters) */
-#define LIGHT_GEL_FLOATS 27 /* psp_ge_light_gel: six face colours, then the gel's forward, left and up */
+#define LIGHT_GEL_FLOATS 28 /* psp_ge_light_gel: six face colours, the gel's forward, left and up, then its cube's key */
 enum
 {
 	DEFER_MODEL_BEGIN = 1, DEFER_MODEL_SHAPE, DEFER_MODEL_EFFECT, DEFER_MODEL_MULTIPURPOSE, DEFER_DRAW_MODEL,
@@ -620,6 +620,9 @@ enum { TXPT_LEVEL_BASE, TXPT_LIGHTMAP, TXPT_LEVEL_DETAIL, TXPT_MODEL_BASE, TXPT_
 	TXPT_DECAL, TXPT_BLIP, TXPT_BLIPS_END };
 #define PRETOUCHING() (pretouch_on && !me_overlap && DEFER_RECORDING() && !defer_paused)
 #define GE_PRETOUCH(key, kind) do { if (PRETOUCHING()) pretouch(key, kind, 0); } while (0)
+/* the HUD's and the motion sensor's: pinned, past the frame's budget and the
+ceiling (psp_tex_pretouch, "hudpinme") */
+#define GE_PRETOUCH_HUD(key, kind) do { if (PRETOUCHING()) pretouch(key, kind, 3); } while (0)
 /* a texture the replay binds only for some draws (a level's detail maps,
 only near the eye): marked only if it's resident already, so it costs no
 load and no room ("txptall": loaded too) */
@@ -1037,10 +1040,12 @@ static int defer_model_multipurpose(unsigned int multipurpose_key, unsigned int 
 
 static int defer_model_reflection(unsigned int cube_key, float const *rgb)
 {
-	defer_word *at = defer_take(DEFER_MODEL_REFLECTION, 1 + 4);
+	/* the key, then the copy's flag and its 4 floats: the tint and which of
+	Chief's parts it is */
+	defer_word *at = defer_take(DEFER_MODEL_REFLECTION, 1 + 1 + 4);
 
 	at[0].u = cube_key;
-	defer_copy(at + 1, rgb, 3);
+	defer_copy(at + 1, rgb, 4);
 	return 1;
 }
 
@@ -1473,7 +1478,7 @@ static void defer_replay(const defer_word *buffer, unsigned int used, int on_me)
 			psp_ge_model_detail(w[0].u, w[1].f, w[2].f);
 			break;
 		case DEFER_MODEL_REFLECTION:
-			psp_ge_model_reflection(w[0].u, defer_copy_back(w + 1, &rest, 3));
+			psp_ge_model_reflection(w[0].u, defer_copy_back(w + 1, &rest, 4));
 			break;
 		case DEFER_DRAW_MODEL:
 			psp_ge_draw_model((void *)w[0].p, w[1].i, w[2].i, (const unsigned short *)w[3].p, w[4].i, w[5].i,
@@ -4138,6 +4143,12 @@ static volatile int boot_frozen = 0;
 /* the buffer being drawn (relative to VRAM), swapped each frame */
 static void *draw_buffer = (void *)0;
 static unsigned long frames = 0, draws_this_frame = 0, triangles_this_frame = 0;
+
+/* the frame in hand, for log lines that name one (phasemark, psp_platform.c) */
+unsigned long psp_ge_frame_number(void)
+{
+	return frames;
+}
 static unsigned long clipped_this_frame = 0, culled_this_frame = 0, model_draws_this_frame = 0;
 
 /* the camera, for the CPU's checks: position, and its right, up and forward
@@ -4215,7 +4226,7 @@ size, so a line that is the smallest mip level's colour shows the texture */
 static int magenta = -1;
 static int tex_level_mode = GU_TEXTURE_AUTO;
 static float tex_bias = 0.0f;
-#define SHOWCASE_BIAS_DEFAULT 0 /* quarter levels; off: a bias across the whole menu smears the ring and the sky */
+#define SHOWCASE_BIAS_DEFAULT 8 /* quarter levels: two levels coarser, judged right on a PSP-1000 by hand (sharper levels shimmer on the hull); a bias smears the ring and the sky some, so 4 is still to be tried by hand; showcasebias0 as before */
 static int in_sky;
 static unsigned long ge_part_us[GE_PARTS], ge_part_calls[GE_PARTS];
 static const char *const ge_part_names[GE_PARTS] = {
@@ -4795,6 +4806,7 @@ static int near_auto_full = -1, near_auto_check = -1;
 static unsigned long near_auto_checked = 0, near_auto_differed = 0;
 static int near_auto = 0;
 static int near_scale = -1; /* build 77: file scope, for the debug menu */
+static int showcase_near = -1;
 /* build 79's GE antialias flag ("geaa", GU_LINE_SMOOTH) is gone in build 80:
 on the hardware it is for lines (PPSSPP's reading: the texture is looked up
 by screen position and alpha halved), and with triangles it painted every
@@ -5969,7 +5981,16 @@ static float window_begin_main(const float *position, float z_near, float z_far)
 		frames, the error loop when a map is missing) the level and the
 		player are gone, and its tests read them (b107's b30 run: a bus
 		error at the level's end); the game's own plane then */
-		if (near_auto && psp_game_running())
+		/* the main menu's near plane x4, whatever nearauto would choose: the
+		ring's panels overlap and the 16-bit depth could not tell them apart,
+		so they cut each other open. The menu's camera never
+		comes within the wider plane of anything, and the showcase rule keeps
+		it off every level. "showcasenearoff": the levels' own choice */
+		if (showcase_near < 0)
+			showcase_near = !psp_keep("showcasenearoff");
+		if (psp_showcase_map && showcase_near)
+			z_near *= 4;
+		else if (near_auto && psp_game_running())
 			z_near = near_plane_auto(position, z_near);
 		else if (!near_auto)
 			z_near *= near_scale;
@@ -6897,15 +6918,31 @@ default; elsewhere the heap has room, and the move would cost the geometry
 cache's misses for nothing. "heaproomoff" turns it off, "heaproom256" on with
 any geometry cache (with a 1 MB one its bytes come from the textures). A
 384 KB size (128 KB more from the textures) cost b30 texture loads and frames
-drawn with a texture missing, so it is gone (docs/review_sv.md) */
+drawn with a texture missing, so it is gone (docs/review_sv.md).
+"heaproomN" (N KB, in 128s, 128 to 768): the same move at another size, the
+geometry cache paying all of it down to 1 MB, so the textures keep what they
+had. In the carve's own steps: the carve is taken 128 KB at a time, so a
+size between them takes the rest from the textures, and b30 then draws many
+more frames with a texture missing. Smaller vertex formats (PRECONVERT) let the cache hold the same play in
+less, and this is how those bytes reach the heap; the replay of the cache at
+smaller sizes prices each map (memory_survey_b144.md, section 7, on research/memtrace until it merges) */
+#define HEAPROOM_MOST_KB 768
 unsigned int psp_heaproom_bytes(void)
 {
 #ifndef PSP_MULTIPLAYER
 	int psp_keep(const char *name);
+	int psp_keep_number(const char *prefix, int fallback);
+	int kb;
 
 	if (psp_keep("heaproomoff"))
 		return 0;
-	if (psp_keep("heaproom256") || (inflight_buffer_bytes() && (psp_keep("geo2") || psp_keep("geo15"))))
+	kb = psp_keep_number("heaproom", 0);
+	if (kb > 0)
+	{
+		kb = (kb + 127) & ~127;
+		return (unsigned int)(kb < HEAPROOM_MOST_KB ? kb : HEAPROOM_MOST_KB) * 1024u;
+	}
+	if (inflight_buffer_bytes() && (psp_keep("geo2") || psp_keep("geo15")))
 		return 256 * 1024;
 #endif
 	return 0; /* the multiplayer build's maps keep their geometry cache in the heap and carve nothing */
@@ -7252,8 +7289,13 @@ static void *copy_alloc(unsigned int bytes, void **owner)
 			carve_want += size;
 		return NULL;
 	}
-	/* 16-byte aligned like the arena's blocks (the 16-bit copies had memalign) */
-	pointer = memalign(ARENA_ALIGN, bytes);
+	/* 16-byte aligned like the arena's blocks (the 16-bit copies had memalign).
+	A refusal isn't a failure: the carve may grow for it (below) */
+	{
+		extern void *psp_heap_try_memalign(size_t alignment, size_t size);
+
+		pointer = psp_heap_try_memalign(ARENA_ALIGN, bytes);
+	}
 	if (pointer && overflow && stream_room > 0)
 	{
 		arena_from_heap++;
@@ -8340,7 +8382,12 @@ void psp_ge_stencils_reserve(void)
 	sceIoClose(file);
 	if (size <= 64)
 		return;
-	stencils_held = memalign(64, size);
+	/* a refusal here isn't a failure: the map's own load asks again */
+	{
+		extern void *psp_heap_try_memalign(size_t alignment, size_t size);
+
+		stencils_held = psp_heap_try_memalign(64, size);
+	}
 	if (stencils_held)
 		stencils_held_size = size;
 	platform_log("stencils: %s's %d KB %s as the old map was let go", path, size / 1024,
@@ -8411,7 +8458,18 @@ void psp_ge_stencils_open(const char *name, unsigned int map_crc)
 		free(stencils_held);
 		stencils_held = NULL;
 		stencils_held_size = 0;
-		bake.file = size > 64 ? memalign(64, size) : NULL;
+		/* the load's end asks once more (below), so only that last ask is
+		a failure the overlay should count */
+		if (size <= 64)
+			bake.file = NULL;
+		else if (stencils_retrying || stencils_old_way())
+			bake.file = memalign(64, size);
+		else
+		{
+			extern void *psp_heap_try_memalign(size_t alignment, size_t size);
+
+			bake.file = psp_heap_try_memalign(64, size);
+		}
 		if (!bake.file && size > 64 && !stencils_old_way() && !stencils_retrying)
 		{
 			/* no room while the load holds its temporaries: once more at its end */
@@ -10675,6 +10733,7 @@ static ScePspFVector3 model_light_toward[2];
 place and a colour already scaled by its reach at the model's centre
 (psp_fixups.py, the model's begin) */
 static int model_point_count = 0;
+static unsigned int model_detail_key; /* psp_ge_model_detail, below */
 static unsigned int model_point_color[2];
 static ScePspFVector3 model_point_position[2];
 static unsigned long model_point_parts = 0;
@@ -10729,6 +10788,11 @@ void psp_ge_model_begin(const float *node_matrices, int node_matrix_count, float
 	model_ambient = ambient ? color_from_rgb_scaled(ambient, model_ambient_gain) : MODEL_LIGHT;
 	model_light_count = light_count < 0 ? 0 : light_count > 2 ? 2 : light_count;
 	model_point_count = 0; /* build 117: psp_ge_model_point_light follows */
+	/* a part's detail map is set by its own call (psp_ge_model_detail), made
+	only where a detail pass is wanted: the menu's showcase, or Chief with
+	chiefdetail. The draw body no longer checks the showcase, so a key left
+	from the menu's last part must not reach the next map's models */
+	model_detail_key = 0;
 	for (index = 0; index < model_light_count; index++)
 	{
 		const float *light = index ? light1 : light0;
@@ -10926,6 +10990,34 @@ then sends what b116 sent) */
 static int lit_points_maybe_on = 0;
 static unsigned long lit_sets_sent = 0, lit_sets_memo = 0;
 
+/* "modelspecular" (opt-in while it is priced): a shiny part's highlight from
+the GE's own specular lighting. The Xbox adds a part's reflection over its
+lit base (psp_ge_model_reflection); its brightest share, the sky or a lamp
+in the cube map, shows as a glint that moves as the part turns. Here the
+two directional lights are also specular lights of their own colour, the
+part's specular material is its reflection's strength (part_specular, 0 for
+a part that reflects nothing), and the GE adds the specular term after the
+texture (separate specular colour), so the glint stays in shade as the
+Xbox's sheen does. Per vertex, in the lighting the GE does anyway: no pass
+of its own. "specpowerN": the highlight's exponent (8); "specgainN": the
+strength in percent (200: the shader's reflection strength is a mean over
+the mask, and the highlight stands for its brightest part) */
+int psp_keep_number(const char *prefix, int fallback);
+/* the reflection words (reflection_keeps, below): read once on the main
+CPU, written back, and from then on only read, by whichever CPU replays the
+draws. A cache line of their own, the type's alignment padding the struct
+to it. Each was a lazy static (-1 until read) on the lines the main CPU
+writes while the ME works (PSP_MAIN_SIDE): a Media Engine that still saw -1
+read them again itself and wrote that line under the main CPU's dirty copy,
+and on the PSP Chief drew yellow-orange in a run with the visor on,
+where the emulator's one cache drew him right */
+static struct __attribute__((aligned(64))) reflection_words {
+	int read, specular, env_fp, env_near, env_pixels, env_gain, env_min, chief_visor, chief_visor_gain;
+	float specular_power, specular_gain;
+} reflection_words = { 0, 0, 0, 0, 160, 100, 0, 0, 150, 8.0f, 2.0f };
+static unsigned int part_specular = 0;
+static unsigned long specular_parts = 0;
+
 /* lighting changed outside model_lighting: 0 turned off; 1 the lights'
 parameters; 2 everything unknown (a frame's start) */
 static void lit_forget(int what)
@@ -10955,6 +11047,19 @@ static void model_lighting(int on)
 	}
 	if (lit_enabled != 1)
 		sceGuEnable(GU_LIGHTING); /* (each part turns lighting off for its later passes: not counted) */
+	if (reflection_words.specular)
+	{
+		/* the part's own: sceGuColor set every material colour to the
+		part's, so this is sent for every part */
+		if (!lit_params)
+		{
+			sceGuLightMode(GU_SEPARATE_SPECULAR_COLOR);
+			sceGuSpecular(reflection_words.specular_power);
+		}
+		sceGuMaterial(GU_SPECULAR, (int)part_specular);
+		if (part_specular & 0xFFFFFF)
+			specular_parts++;
+	}
 	if (!lit_params || lit_ambient != model_ambient)
 	{
 		sceGuAmbient(model_ambient);
@@ -10966,12 +11071,15 @@ static void model_lighting(int on)
 		{
 			if (!lit_params || memcmp(&lit_toward[index], &model_light_toward[index], sizeof(ScePspFVector3)) != 0)
 			{
-				sceGuLight(index, GU_DIRECTIONAL, GU_DIFFUSE, &model_light_toward[index]);
+				sceGuLight(index, GU_DIRECTIONAL, reflection_words.specular ? GU_DIFFUSE_AND_SPECULAR : GU_DIFFUSE,
+					&model_light_toward[index]);
 				sent = 1;
 			}
 			if (!lit_params || lit_color[index] != model_light_color[index])
 			{
 				sceGuLightColor(index, GU_DIFFUSE, model_light_color[index]);
+				if (reflection_words.specular)
+					sceGuLightColor(index, GU_SPECULAR, model_light_color[index]);
 				sent = 1;
 			}
 			if (!lit_params || !lit_on[index])
@@ -12162,6 +12270,9 @@ int psp_tex_palette(unsigned int key, const unsigned int **palette, int *count);
 int psp_tex_palette16(unsigned int key, const unsigned short **palette, int *count);
 static unsigned int change_key = 0, change_color = 0xFFFFFFFF, glow_color = 0, glow_key = 0;
 static unsigned long change_passes = 0, glow_passes = 0, glow_mapped = 0;
+/* change passes left out because the multipurpose map wasn't resident when
+the pass ran (its part drawn without the change colour that frame) */
+static unsigned long change_unbound = 0;
 static int in_sky;
 
 struct skin_part;
@@ -12944,17 +13055,47 @@ patch of it under its key, texpack.py), else REFLECTION_CUBE_DEFAULT.
 #define REFLECTION_CUBE_DEFAULT 0.35f
 static unsigned int reflection_cube_key = 0;
 static float reflection_rgb[3] = { 0.0f, 0.0f, 0.0f };
+/* which of Chief's parts the part is: 1 his visor, 2 his armour, 0 none
+(psp_fixups.py, by the shader's name) */
+static int reflection_chief = 0;
 static int reflection_off = -1;
 static unsigned long reflection_parts = 0, reflection_cubes_known = 0;
+
+static void reflection_keeps(void);
+/* Chief's visor gets the reflection pass wherever he is drawn at least 24
+pixels across, at chiefvisorgainN percent (150): a restoration, one of the
+campaign's defaults (psp_platform.c; "nochiefvisor" turns it off). On the
+Xbox the visor's gold is its cube map's, added over a near-black base:
+folded into the lighting it can't show, since the GE's ambient stops at 1
+and the base x 1 stays dark */
 
 void psp_ge_model_reflection(unsigned int cube_key, float const *rgb)
 {
 	GE_BENCH_SKIP();
+	reflection_keeps();
+	if (reflection_words.chief_visor > 0 && rgb && (int)rgb[3] == 1)
+	{
+		static int logged = 0;
+		int width = 0, height = 0;
+
+		if (!logged)
+		{
+			logged = 1;
+			psp_tex_size(cube_key, &width, &height);
+			platform_log("GE: chiefvisor: the visor's reflection %.2f %.2f %.2f, its map %08x %dx%d (a sphere map is 32x32)",
+				rgb[0], rgb[1], rgb[2], cube_key, width, height);
+		}
+	}
+	/* a reflection pass binds the part's sphere map in the replay */
+	if (reflection_words.env_fp > 0 || reflection_words.env_near > 0 ||
+		(reflection_words.chief_visor > 0 && rgb && (int)rgb[3] == 1))
+		GE_PRETOUCH(cube_key, TXPT_MODEL_DETAIL);
 	GE_DEFER(defer_model_reflection(cube_key, rgb));
 	reflection_cube_key = cube_key;
 	reflection_rgb[0] = rgb ? rgb[0] : 0.0f;
 	reflection_rgb[1] = rgb ? rgb[1] : 0.0f;
 	reflection_rgb[2] = rgb ? rgb[2] : 0.0f;
+	reflection_chief = rgb ? (int)rgb[3] : 0;
 }
 
 int psp_tex_average_known(unsigned int key, unsigned int *abgr);
@@ -12995,24 +13136,155 @@ static unsigned int ambient_with_reflection(unsigned int base_key)
 	return color_from_rgb(ambient);
 }
 
-/* a pass over the part's triangles with the multipurpose map's mask: 0 the
-change colour (white toward the colour by the blue, multiplied in), 1 the
-self-illumination (the colour by the green, added) */
-/* build 66: the worked-out palettes kept, by map and pass. A slot is reused
-only when nothing this frame still needs it (the GE reads a palette when the
-list runs), as the meters' (METER_CACHE). Build 106: the palette is the
-mask alone (grey), and the GE applies the colour: the change pass with its
-blend texture function (fragment white x (1 - mask) + colour x mask, the
-colour as the environment colour), the glow pass modulating the colour by
-the mask. Until b105 the colour was worked into each palette entry, so every
-marine's own armour colour was a palette of its own, more than the cache's
-six slots in a fight: 6% of b30's beach fight in the emulator's PC samples.
-Build 107: 40 slots (40 KB). With six, b30's fight still had more masks in
-use a frame than slots (about 60 palettes worked out a frame, 13 reused), and
-each one past the slots was worked out again into the display list: about
-1 KB each, up to half of the 100-160 KB of data the models copied into the
-list a frame */
-#define MULTIPURPOSE_CACHE 40
+/* a part's reflection strength (0-1 a channel): the shader's brightness and
+tint times the multipurpose map's mask on average, as folded into the
+ambient above; 0 when the part reflects nothing or "noreflection" */
+static int reflection_strength(float *rgb)
+{
+	unsigned int mask_abgr;
+	float mask = 0.5f;
+	int channel;
+
+	if (reflection_off > 0 || reflection_rgb[0] + reflection_rgb[1] + reflection_rgb[2] <= 0.004f)
+		return 0;
+	/* a part without a multipurpose map reflects over its whole surface (a
+	visor, glass), and so does Chief's visor: its multipurpose map's average
+	isn't its reflection mask (the pack keeps the map for its change colour) */
+	if (!change_key || reflection_chief == 1)
+		mask = 1.0f;
+	else if (psp_tex_average_known(change_key, &mask_abgr))
+		mask = (float)(mask_abgr & 0xFF) * (1.0f / 255.0f);
+	for (channel = 0; channel < 3; channel++)
+	{
+		rgb[channel] = reflection_rgb[channel] * mask;
+		rgb[channel] = rgb[channel] > 1.0f ? 1.0f : rgb[channel];
+	}
+	return 1;
+}
+
+/* "envfp", "envnear" (opt-in while they are priced): a shiny part's
+reflection drawn as the Xbox draws it, added over the lit base, for the
+first-person weapon (envfp) and for models at least envpixelsN pixels
+across on the screen (envnear, 160: Chief in a cutscene, a vehicle beside
+the player), instead of folded into the ambient. The bake turns the
+part's cube map into a sphere map (texpack.py, sphere_map); the GE's
+environment mapping picks its texel from the normal's two components along
+the camera's right and up (lights 2 and 3 carry them; lighting is off for
+this pass), and the pass adds it times the part's strength where pass 1
+drew. The mask is the part's average (one texture a pass, and the frame
+has no alpha to hold the mask in): a part shiny in places shines evenly.
+A pass more per such part. "envgainN": the strength in percent (100).
+"envminN": only parts whose strongest channel reflects at least N percent
+(a visor or glass, not the armour around it, whose mask the pass can't
+apply) */
+static unsigned long env_passes = 0, env_unbound = 0;
+/* the visor's parts reaching the draw: all, textured and lit, shiny, and how
+many pixels across the last one was */
+static unsigned long visor_drawn = 0, visor_textured = 0, visor_shiny = 0;
+static float visor_pixels = 0.0f;
+
+/* the reflection words, read on the main CPU at its first reflection call,
+before any record that needs them is replayed (reflection_words, above) */
+static void reflection_keeps(void)
+{
+	if (reflection_words.read || psp_on_me())
+		return;
+	reflection_words.specular = psp_keep("modelspecular");
+	reflection_words.specular_power = (float)psp_keep_number("specpower", 8);
+	reflection_words.specular_gain = (float)psp_keep_number("specgain", 200) * (1.0f / 100.0f);
+	if (reflection_words.specular)
+		platform_log("GE: modelspecular: shiny parts' highlights from the GE's specular lighting, power %.0f",
+			reflection_words.specular_power);
+	reflection_words.env_near = psp_keep("envnear");
+	reflection_words.env_pixels = psp_keep_number("envpixels", 160);
+	reflection_words.env_gain = psp_keep_number("envgain", 100);
+	reflection_words.env_min = psp_keep_number("envmin", 0);
+	reflection_words.chief_visor = psp_keep("chiefvisor");
+	reflection_words.chief_visor_gain = psp_keep_number("chiefvisorgain", 150);
+	if (reflection_words.chief_visor)
+		platform_log("GE: chiefvisor: Chief's visor drawn with its reflection pass, gain %d%%",
+			reflection_words.chief_visor_gain);
+	reflection_words.env_fp = psp_keep("envfp");
+	if (reflection_words.env_fp || reflection_words.env_near)
+		platform_log("GE: reflections drawn as a pass: %s%s (at %d pixels across), gain %d%%, parts reflecting at least %d%%",
+			reflection_words.env_fp ? "first person " : "", reflection_words.env_near ? "near models" : "",
+			reflection_words.env_pixels, reflection_words.env_gain, reflection_words.env_min);
+	reflection_words.read = 1;
+	sceKernelDcacheWritebackRange(&reflection_words, sizeof(reflection_words));
+}
+
+static int env_part(const float *strength)
+{
+	int width, height;
+	float most = strength[0] > strength[1] ? strength[0] : strength[1];
+
+	if (reflection_words.chief_visor && reflection_chief == 1 && model_pixels >= 24.0f)
+		return reflection_cube_key && psp_tex_size(reflection_cube_key, &width, &height) && width == 32 && height == 32;
+	most = most > strength[2] ? most : strength[2];
+	if (most * 100.0f < (float)reflection_words.env_min)
+		return 0;
+	if (!(model_first_person ? reflection_words.env_fp :
+		reflection_words.env_near && model_pixels >= (float)reflection_words.env_pixels))
+		return 0;
+	return reflection_cube_key && psp_tex_size(reflection_cube_key, &width, &height) && width == 32 && height == 32;
+}
+
+static int reflection_env_pass(void *vertices, const unsigned short *indices, long index_count, int strip,
+	struct skin_part *skin, ScePspFMatrix4 *model, const float *strength)
+{
+	ScePspFVector3 across, upward;
+	float gain = (float)(reflection_chief == 1 && reflection_words.chief_visor ? reflection_words.chief_visor_gain :
+		reflection_words.env_gain) * (1.0f / 100.0f);
+	unsigned int color;
+
+	if (!psp_tex_bind(reflection_cube_key, NULL))
+		return 0;
+	color = 0xFF000000u | ((unsigned int)PSP_CLAMP_255((int)(strength[2] * gain * 255.0f)) << 16) |
+		((unsigned int)PSP_CLAMP_255((int)(strength[1] * gain * 255.0f)) << 8) |
+		(unsigned int)PSP_CLAMP_255((int)(strength[0] * gain * 255.0f));
+	sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGB);
+	sceGuColor(color);
+	sceGuDisable(GU_ALPHA_TEST);
+	sceGuTexWrap(GU_CLAMP, GU_CLAMP);
+	sceGuTexScale(1.0f, 1.0f);
+	sceGuTexOffset(0.0f, 0.0f);
+	/* u from the normal along the camera's right, v along its down (the
+	sphere map's first row is up): the GE takes (1 + n . light) / 2 */
+	across.x = camera_right[0];
+	across.y = camera_right[1];
+	across.z = camera_right[2];
+	upward.x = -camera_up[0];
+	upward.y = -camera_up[1];
+	upward.z = -camera_up[2];
+	sceGuLight(2, GU_DIRECTIONAL, GU_DIFFUSE, &across);
+	sceGuLight(3, GU_DIRECTIONAL, GU_DIFFUSE, &upward);
+	lit_forget(1);
+	sceGuTexMapMode(GU_ENVIRONMENT_MAP, 2, 3);
+	sceGuDepthFunc(GU_EQUAL);
+	sceGuDepthMask(GU_TRUE);
+	/* added light fades to nothing in the fog */
+	sceGuFog(fog_near, fog_far, 0xFF000000);
+	sceGuBlendFunc(GU_ADD, GU_FIX, GU_FIX, 0xFFFFFF, 0xFFFFFF);
+	ge_blend(1);
+	model_geometry(vertices, indices, index_count, strip, skin, model);
+	ge_blend(0);
+	sceGuTexMapMode(GU_TEXTURE_COORDS, 0, 0);
+	sceGuTexWrap(GU_REPEAT, GU_REPEAT);
+	sceGuFog(fog_near, fog_far, fog_color);
+	sceGuDepthMask(GU_FALSE);
+	sceGuDepthFunc(GU_GEQUAL);
+	sceGuColor(0xFFFFFFFF);
+	return 1;
+}
+
+/* the change colour multiplied in by the multipurpose map's mask, with the
+GE's blend texture function: fragment white x (1 - mask) + colour x mask,
+the colour as the environment colour. The mask is a CLUT the bake made from
+the map's palette (its blue: texpack.py, change_mask) and placed after the
+map's levels: the Media Engine replays this pass and can't read a texture
+in VRAM (B25: Chief and the crew drawn white or red on the PSP), so nothing
+here reads the texture; the GE loads the mask from wherever the map lives.
+Until b144 the mask was worked out from the palette into a 40-slot cache */
 int psp_tex_has(unsigned int key);
 
 /* the self-illumination with the pack's glow map (the base x the
@@ -13021,9 +13293,11 @@ by the mask is added to the lighting, which then multiplies the base map, so
 a lit-up area shows its own texture at full brightness (texpack.py,
 glow_looks). The mask alone, added as it was, drew the main menu's ring as a
 white band and every other self-illuminated part in its flat colour.
-"glowflat" (keep.txt) draws the mask alone again. A map not yet in memory
-leaves the part unlit this frame rather than flashing the flat colour */
-static int glow_flat = -1;
+A map not yet in memory leaves the part unlit this frame rather than
+flashing the flat colour. A part with a glow colour and no glow map in the
+pack isn't lit either (glow_unmapped: none on b30, a10 or c20; the mask
+alone, as before b119, would read the multipurpose map's palette) */
+static unsigned long glow_unmapped = 0;
 
 static int glow_add = -1, glow_no_clamp = -1;
 static unsigned int glow_base_key = 0; /* the part's base, for the clamp: psp_ge_draw_model_body */
@@ -13169,127 +13443,34 @@ static void __attribute__((noinline, cold)) model_detail_pass(void *vertices, co
 	sceGuDepthMask(GU_FALSE);
 	sceGuDepthFunc(GU_GEQUAL);
 }
-static unsigned int multipurpose_cache_palette[MULTIPURPOSE_CACHE][256] __attribute__((aligned(64)));
-static struct
-{
-	unsigned int key;
-	unsigned long frame;
-	int which, count;
-} multipurpose_cache[MULTIPURPOSE_CACHE];
-static unsigned long multipurpose_worked = 0, multipurpose_reused = 0;
-
-static int multipurpose_pass(int which, void *vertices, const unsigned short *indices, long index_count, int strip,
+static int change_pass(void *vertices, const unsigned short *indices, long index_count, int strip,
 	struct skin_part *skin, ScePspFMatrix4 *model)
 {
-	const unsigned int *palette = NULL;
-	const unsigned short *palette16 = NULL;
-	unsigned int *computed = NULL, color = which ? glow_color : change_color;
-	int count = 0, entry, slot, free_slot = -1, hit = 0;
-	/* a 16-bit palette's 5- and 6-bit channels to 8 bits (v * 255 / 31, / 63) */
-	static unsigned char expand_5[32], expand_6[64];
+	extern const void *psp_tex_change_mask(unsigned int key, int *count);
+	const void *mask;
+	int count;
 
-	if (!expand_5[31])
-	{
-		for (entry = 0; entry < 32; entry++)
-			expand_5[entry] = (unsigned char)(entry * 255 / 31);
-		for (entry = 0; entry < 64; entry++)
-			expand_6[entry] = (unsigned char)(entry * 255 / 63);
-	}
-
-	if (which && glow_key)
-	{
-		if (glow_flat < 0)
-		{
-			glow_flat = psp_keep("glowflat");
-			if (glow_flat)
-				platform_log("GE: glowflat: self-illumination as the colour by the mask, without the glow maps");
-		}
-		if (!glow_flat && psp_tex_has(glow_key))
-			return glow_map_pass(vertices, indices, index_count, strip, skin, model);
-	}
 	/* the Xbox's channel order, read off the Xbox disc's own Blood Gulch
 	(the cyborg's map: the armour plates solid in blue, alpha all white): red
 	the reflection mask, green self-illumination, blue the change colour,
 	alpha the detail mask. Gearbox's PC release reordered them */
-	if (!psp_tex_bind(change_key, NULL) ||
-		!(psp_tex_palette(change_key, &palette, &count) || psp_tex_palette16(change_key, &palette16, &count)))
+	if (!psp_tex_bind(change_key, NULL) || !(mask = psp_tex_change_mask(change_key, &count)))
+	{
+		change_unbound++;
 		return 0;
-	for (slot = 0; slot < MULTIPURPOSE_CACHE; slot++)
-	{
-		if (multipurpose_cache[slot].key == change_key &&
-			multipurpose_cache[slot].which == which && multipurpose_cache[slot].count == count)
-		{
-			computed = multipurpose_cache_palette[slot];
-			multipurpose_cache[slot].frame = frames + 1;
-			multipurpose_reused++;
-			hit = 1;
-			break;
-		}
-		if (multipurpose_cache[slot].frame != frames + 1 &&
-			(free_slot < 0 || multipurpose_cache[slot].frame < multipurpose_cache[free_slot].frame))
-			free_slot = slot;
 	}
-	if (!computed)
-	{
-		if (free_slot >= 0)
-		{
-			computed = multipurpose_cache_palette[free_slot];
-			multipurpose_cache[free_slot].key = change_key;
-			multipurpose_cache[free_slot].which = which;
-			multipurpose_cache[free_slot].count = count;
-			multipurpose_cache[free_slot].frame = frames + 1;
-		}
-		else
-		{
-			computed = list_take(count * 4 + 16);
-			if (!computed)
-				return 0;
-			computed = (unsigned int *)(((unsigned int)computed + 15) & ~15u);
-		}
-		multipurpose_worked++;
-	}
-	for (entry = hit ? count : 0; entry < count; entry++)
-	{
-		unsigned int mask;
-
-		if (which)
-			mask = palette ? (palette[entry] >> 8) & 0xFF : expand_6[(palette16[entry] >> 5) & 0x3F];
-		else
-			mask = palette ? (palette[entry] >> 16) & 0xFF : expand_5[palette16[entry] >> 11];
-		computed[entry] = 0xFF000000 | (mask << 16) | (mask << 8) | mask;
-	}
-	if (!hit)
-		ge_writeback(computed, count * 4);
 	sceGuClutMode(GU_PSM_8888, 0, 0xFF, 0);
-	sceGuClutLoad(count / 8 > 0 ? count / 8 : 1, computed);
-	if (which)
-	{
-		/* the colour by the mask */
-		sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGB);
-		sceGuColor(0xFF000000 | color);
-	}
-	else
-	{
-		/* white toward the colour by the mask */
-		sceGuTexFunc(GU_TFX_BLEND, GU_TCC_RGB);
-		sceGuTexEnvColor(color);
-		sceGuColor(0xFFFFFFFF);
-	}
+	sceGuClutLoad(count / 8, mask);
+	/* white toward the colour by the mask */
+	sceGuTexFunc(GU_TFX_BLEND, GU_TCC_RGB);
+	sceGuTexEnvColor(change_color);
+	sceGuColor(0xFFFFFFFF);
 	sceGuDisable(GU_ALPHA_TEST);
 	sceGuDepthFunc(GU_EQUAL);
 	sceGuDepthMask(GU_TRUE);
-	if (which)
-	{
-		/* added light fades to nothing in the fog */
-		sceGuFog(fog_near, fog_far, 0xFF000000);
-		sceGuBlendFunc(GU_ADD, GU_FIX, GU_FIX, 0xFFFFFF, 0xFFFFFF);
-	}
-	else
-	{
-		/* fogged toward white: far off, nothing changes */
-		sceGuFog(fog_near, fog_far, 0xFFFFFFFF);
-		sceGuBlendFunc(GU_ADD, GU_DST_COLOR, GU_FIX, 0, 0);
-	}
+	/* fogged toward white: far off, nothing changes */
+	sceGuFog(fog_near, fog_far, 0xFFFFFFFF);
+	sceGuBlendFunc(GU_ADD, GU_DST_COLOR, GU_FIX, 0, 0);
 	ge_blend(1);
 	model_geometry(vertices, indices, index_count, strip, skin, model);
 	ge_blend(0);
@@ -13297,7 +13478,6 @@ static int multipurpose_pass(int which, void *vertices, const unsigned short *in
 	sceGuDepthMask(GU_FALSE);
 	sceGuDepthFunc(GU_GEQUAL);
 	sceGuTexEnvColor(0xFFFFFFFF);
-	sceGuColor(0xFFFFFFFF);
 	return 1;
 }
 
@@ -14495,6 +14675,8 @@ static void psp_ge_draw_model_body(void *vertices, int vertex_count, int uncompr
 	int base_alpha = 0, textured, soft = 0, two_sided = (alpha_tested & 2) != 0;
 	struct skin_part *skin = NULL;
 	unsigned int part_ambient;
+	float shine[3] = { 0.0f, 0.0f, 0.0f };
+	int shiny, env;
 
 	alpha_tested &= 1;
 	model_cut_count = 0;
@@ -14725,8 +14907,21 @@ static void psp_ge_draw_model_body(void *vertices, int vertex_count, int uncompr
 	else
 		sceGuColor(color);
 	part_ambient = model_ambient;
-	if (textured && model_camouflage <= 0.0f && !in_sky)
+	shiny = textured && model_camouflage <= 0.0f && !in_sky && reflection_strength(shine);
+	if (reflection_chief == 1)
+	{
+		visor_drawn++;
+		visor_textured += textured != 0;
+		visor_shiny += shiny != 0;
+		visor_pixels = model_pixels;
+	}
+	env = shiny && env_part(shine);
+	if (textured && model_camouflage <= 0.0f && !in_sky && !env)
 		model_ambient = ambient_with_reflection(base_key);
+	part_specular = shiny && reflection_words.specular > 0 ? 0xFF000000u |
+		((unsigned int)PSP_CLAMP_255((int)(shine[2] * reflection_words.specular_gain * 255.0f)) << 16) |
+		((unsigned int)PSP_CLAMP_255((int)(shine[1] * reflection_words.specular_gain * 255.0f)) << 8) |
+		(unsigned int)PSP_CLAMP_255((int)(shine[0] * reflection_words.specular_gain * 255.0f)) : 0xFF000000u;
 	model_lighting(1);
 	if (camo_shimmer < 0)
 		camo_shimmer = psp_keep("camoshimmer");
@@ -14815,7 +15010,7 @@ static void psp_ge_draw_model_body(void *vertices, int vertex_count, int uncompr
 		/* "noglowpass" (recon): which brightness on a model is its self-illumination */
 		static int glow_off = -1;
 
-		if (change_color != 0xFFFFFFFF && multipurpose_pass(0, vertices, indices, index_count, strip, skin, &model))
+		if (change_color != 0xFFFFFFFF && change_pass(vertices, indices, index_count, strip, skin, &model))
 		{
 			change_passes++;
 			CENSUS(census_tint(base_key, change_key, change_color));
@@ -14823,10 +15018,31 @@ static void psp_ge_draw_model_body(void *vertices, int vertex_count, int uncompr
 		if (glow_off < 0)
 			glow_off = psp_keep("noglowpass");
 		glow_base_key = base_key; /* the clamp's base (glow_map_pass) */
-		if (glow_color && !glow_off && multipurpose_pass(1, vertices, indices, index_count, strip, skin, &model))
-			glow_passes++;
+		if (glow_color && !glow_off)
+		{
+			if (!psp_tex_has(glow_key))
+				glow_unmapped++;
+			else if (glow_map_pass(vertices, indices, index_count, strip, skin, &model))
+				glow_passes++;
+		}
 	}
-	if (textured && model_detail_key && psp_showcase_map && model_camouflage <= 0.0f && !in_sky)
+	if (env)
+	{
+		static int visor_logged = 0;
+
+		if (reflection_chief == 1 && !visor_logged && !PSP_ME_WORK())
+		{
+			visor_logged = 1;
+			platform_log("GE: chiefvisor: the visor's pass at strength %.2f %.2f %.2f x gain %d%%, %.0f pixels across",
+				shine[0], shine[1], shine[2], reflection_words.chief_visor_gain, model_pixels);
+		}
+		if (reflection_env_pass(vertices, indices, index_count, strip, skin, &model, shine))
+			env_passes++;
+		else
+			env_unbound++;
+		sceGuTexScale(model_u_scale * (u_scale != 0.0f ? u_scale : 1.0f), model_v_scale * (v_scale != 0.0f ? v_scale : 1.0f));
+	}
+	if (textured && model_detail_key && model_camouflage <= 0.0f && !in_sky)
 		model_detail_pass(vertices, indices, index_count, strip, skin, &model);
 	if (model_camouflage > 0.0f)
 	{
@@ -17017,6 +17233,17 @@ static PSP_MAIN_SIDE unsigned long overlay_wall_asks = 0, overlay_on_walls = 0, 
 
 static PSP_MAIN_SIDE unsigned long overlay_backing_full = 0;
 
+/* "overlaymemo" (on by default; "overlaymemooff": as before): a list whose
+answers find no heap is asked again for each of
+its triangles (overlay_answers_for), so a full heap failed one calloc per
+triangle per frame: b30's burst at heaproom256 (heapwho1) was ~7,000 failed
+asks a game second, each a walk of the free lists. Remembering the refused
+list for the rest of the frame keeps every answer the same (no room means on
+a wall either way) and asks the heap once */
+static PSP_MAIN_SIDE int overlay_memo = -1;
+static PSP_MAIN_SIDE unsigned int overlay_refused_key = 0, overlay_refused_frame = 0;
+static PSP_MAIN_SIDE unsigned long overlay_no_room = 0, overlay_no_room_skipped = 0;
+
 /* build 112: triangles whose answer work marked as the Media Engine's needed
 and didn't have (gemesim): finding it takes heap for the answers and casts
 the engine's collision rays, which read the game's data while the main CPU
@@ -17103,8 +17330,20 @@ static int overlay_on_a_wall(const struct level_stream *copy, const unsigned sho
 		return overlay_want(copy, indices, triangle_count, triangle);
 	if (!flags)
 	{
-		if (!(flags = calloc(triangle_count, 1)))
+		if (overlay_memo < 0)
+			overlay_memo = !psp_keep("overlaymemooff");
+		if (overlay_memo && key == overlay_refused_key && ge_hot.stream_frame == overlay_refused_frame)
+		{
+			overlay_no_room_skipped++;
 			return 1;
+		}
+		if (!(flags = calloc(triangle_count, 1)))
+		{
+			overlay_no_room++;
+			overlay_refused_key = key;
+			overlay_refused_frame = ge_hot.stream_frame;
+			return 1;
+		}
 		if (overlay_backing_count >= OVERLAY_BACKINGS)
 		{
 			static PSP_MAIN_SIDE int victim = 0;
@@ -18534,7 +18773,7 @@ void psp_ge_screen_quad(void const *vertices, unsigned int key, short blend, flo
 		glyph_next = -1;
 		glyph_sheet_ready();
 	}
-	GE_PRETOUCH(key, TXPT_SCREEN);
+	GE_PRETOUCH_HUD(key, TXPT_SCREEN);
 	/* "meterload": the recording loads a HUD meter's map before the quad is
 	queued, outside pretouch's guards. Off by default: on the PSP it left the
 	bars as empty as before and lost model palettes (Chief's change colours),
@@ -19666,9 +19905,12 @@ static struct
 	int open;
 	/* a gel's six face colours (+X, -X, +Y, -Y, +Z, -Z) and its frame
 	(forward, left, up: the cube's +X, +Y, +Z), when psp_ge_light_gel gave
-	them; gel 0 for a light lit by its colour alone */
+	them; gel 0 for a light lit by its colour alone. gel_cube: the gel
+	itself, sampled at each vertex in place of the faces (psp_tex.c,
+	psp_tex_gel_cube), NULL when the pack keeps none or "nogelcube" */
 	int gel;
 	float gel_faces[18], gel_frame[9];
+	const void *gel_cube;
 } light;
 static unsigned long lights_drawn = 0;
 /* build 119's probe: the light pass's triangles looked at, and those with a
@@ -19711,6 +19953,7 @@ void psp_ge_light_begin(const float *position, const float *forward, const float
 	light.cosine_cutoff = cosine_cutoff;
 	light.cosine_falloff = cosine_falloff > cosine_cutoff ? cosine_falloff : cosine_cutoff + 0.001f;
 	light.gel = 0;
+	light.gel_cube = NULL;
 }
 
 /* the light just begun shaped by its gel (rasterizer.c, after the light's
@@ -19721,21 +19964,30 @@ colours, weighed by how far its direction leans toward each axis. NULL: by
 the colour alone */
 void psp_ge_light_gel(const float *gel)
 {
+	extern const void *psp_tex_gel_cube(unsigned int key);
+
 	GE_DEFER(defer_light_gel(gel));
 	GE_BENCH_SKIP();
 	light.gel = gel != NULL;
+	light.gel_cube = NULL;
 	if (gel)
 	{
+		unsigned int cube_key;
+
 		memcpy(light.gel_faces, gel, sizeof(light.gel_faces));
 		memcpy(light.gel_frame, gel + 18, sizeof(light.gel_frame));
+		memcpy(&cube_key, gel + 27, sizeof(cube_key));
+		light.gel_cube = cube_key ? psp_tex_gel_cube(cube_key) : NULL;
 	}
 }
 
 /* a vertex's gel colour (0-1 a channel): its direction from the light in
-the gel's frame, each axis weighed by its share of the squared length, on
-the face of that axis's sign */
+the gel's frame, looked up in the gel's cube where the pack keeps it, else
+each axis weighed by its share of the squared length, on the face of that
+axis's sign */
 static void light_gel_at(const float *p, float *rgb)
 {
+	extern void psp_tex_gel_cube_at(const void *gel, float x, float y, float z, float *rgb);
 	const float *f = light.gel_frame;
 	float d[3], x, y, z, xx, yy, zz, inverse;
 	const float *fx, *fy, *fz;
@@ -19746,6 +19998,11 @@ static void light_gel_at(const float *p, float *rgb)
 	x = d[0] * f[0] + d[1] * f[1] + d[2] * f[2];
 	y = d[0] * f[3] + d[1] * f[4] + d[2] * f[5];
 	z = d[0] * f[6] + d[1] * f[7] + d[2] * f[8];
+	if (light.gel_cube)
+	{
+		psp_tex_gel_cube_at(light.gel_cube, x, y, z, rgb);
+		return;
+	}
 	xx = x * x;
 	yy = y * y;
 	zz = z * z;
@@ -20127,6 +20384,22 @@ four, again and again (four levels at most) where it can reach the light,
 and each piece lit at its own corners. Keep word "nolightsplit": as before */
 static int light_split_on = -1;
 
+/* B7, a restoration, on by default whatever it costs (the project's call): a
+spotlight's pool drawn with the surface's own texture, as the point lights
+are, its cone worked out per corner. With one texture a pass the projected
+cone took the texture's slot and the surface came in as its average colour
+only, so the flashlight on a10's dark walls was a dim, flat pool while it
+lit models fully. The pieces split finer near the light, so the pool's edge
+stays round. "lightconetex": the projected cone as before */
+static int light_base_tex = -1;
+
+static int light_spot_base(void)
+{
+	if (light_base_tex < 0)
+		light_base_tex = !psp_keep("lightconetex");
+	return light_base_tex;
+}
+
 /* The split decided per edge, not per triangle: two triangles sharing an
 edge split it alike, at the same midpoint (0.5 * (a + b) is the same float
 from either end), so their pieces meet corner to corner. Decided per
@@ -20194,10 +20467,24 @@ static float light_split_tangent = 1.0f;
 static int light_edge_splits(const float *a, const float *b)
 {
 	float near_a = distance_squared3(a, light.position), near_b = distance_squared3(b, light.position);
-	float split = 0.5f * sqrtf(near_a < near_b ? near_a : near_b);
+	float nearest = sqrtf(near_a < near_b ? near_a : near_b), split, least;
 
-	if (split < 0.2f * light.radius)
-		split = 0.2f * light.radius;
+	if (light_spot_base())
+	{
+		/* the cone worked out per corner: pieces about a third of the pool's
+		width where they are, so the pool has corners inside it to be bright
+		and round (by distance alone the pool near the player was two pieces
+		across and drew dim) */
+		split = 0.3f * nearest * (light_split_tangent > 0.05f ? light_split_tangent : 0.05f);
+		least = 0.03f * light.radius;
+	}
+	else
+	{
+		split = 0.5f * nearest;
+		least = 0.2f * light.radius;
+	}
+	if (split < least)
+		split = least;
 	return distance_squared3(a, b) > split * split;
 }
 
@@ -20244,7 +20531,7 @@ static void light_split(float p[3][3], float uv[3][2], const unsigned int normal
 		int pick = -1;
 		float pick_length = 0.0f;
 
-		for (corner = 0; corner < 3 && depth < 6; corner++)
+		for (corner = 0; corner < 3 && depth < (light_spot_base() ? 9 : 6); corner++)
 		{
 			const float *a = p[corner], *b = p[(corner + 1) % 3];
 			float length = distance_squared3(a, b);
@@ -20325,7 +20612,7 @@ static void light_split(float p[3][3], float uv[3][2], const unsigned int normal
 		float corners[3][CORNER_FLOATS], reach[3];
 
 		for (corner = 0; corner < 3; corner++)
-			reach[corner] = light_reach(p[corner], normal[corner], 0);
+			reach[corner] = light_reach(p[corner], normal[corner], light_spot_base());
 		if (reach[0] <= 0.0f && reach[1] <= 0.0f && reach[2] <= 0.0f)
 			return;
 		memset(corners, 0, sizeof(corners));
@@ -20355,6 +20642,7 @@ static void psp_ge_light_draw_body(const void *vertices, int vertex_count, const
 	unsigned char *cone = NULL;
 	ScePspFMatrix4 cone_projection;
 	float tangent = 0.0f, tint[3] = { 1.0f, 1.0f, 1.0f }, saved[3], near_saved;
+	int cone_tex;
 
 	if (!light.open || !frame_open || triangle_count <= 0 || !vertices || !indices || list_full())
 		return;
@@ -20384,14 +20672,21 @@ static void psp_ge_light_draw_body(const void *vertices, int vertex_count, const
 			vertex_count = stream->count;
 		}
 	}
+	cone_tex = spot && !light_spot_base();
 	if (spot)
 	{
-		/* the base texture's average colour (it must be resident) */
-		if (!psp_tex_bind(base_key, &alpha) || !psp_tex_average(base_key, &average))
+		if (!psp_tex_bind(base_key, &alpha))
 			return;
-		tint[0] = (average & 0xFF) / 255.0f;
-		tint[1] = ((average >> 8) & 0xFF) / 255.0f;
-		tint[2] = ((average >> 16) & 0xFF) / 255.0f;
+		/* the projected cone's way: the base texture's average colour (it
+		must be resident) */
+		if (cone_tex)
+		{
+			if (!psp_tex_average(base_key, &average))
+				return;
+			tint[0] = (average & 0xFF) / 255.0f;
+			tint[1] = ((average >> 8) & 0xFF) / 255.0f;
+			tint[2] = ((average >> 16) & 0xFF) / 255.0f;
+		}
 		tangent = sqrtf(1.0f - light.cosine_cutoff * light.cosine_cutoff) / light.cosine_cutoff;
 		cone_matrix(&cone_projection);
 	}
@@ -20477,6 +20772,7 @@ static void psp_ge_light_draw_body(const void *vertices, int vertex_count, const
 			{
 				float p[3][3], uv[3][2], longest = 0.0f;
 				unsigned int normal[3];
+				int split_it;
 
 				for (corner = 0; corner < 3; corner++)
 				{
@@ -20494,7 +20790,14 @@ static void psp_ge_light_draw_body(const void *vertices, int vertex_count, const
 					if (edge > longest)
 						longest = edge;
 				}
-				if (longest > 0.04f * light.radius * light.radius)
+				/* the cone per corner: any edge longer than its piece
+				size there goes to the split, small triangles included */
+				light_split_tangent = tangent;
+				split_it = longest > 0.04f * light.radius * light.radius;
+				if (light_spot_base())
+					for (corner = 0; corner < 3 && !split_it; corner++)
+						split_it = light_edge_splits(p[corner], p[(corner + 1) % 3]);
+				if (split_it)
 				{
 					float nearest = 1e30f;
 
@@ -20527,14 +20830,14 @@ static void psp_ge_light_draw_body(const void *vertices, int vertex_count, const
 			if (memo->tag != tag)
 			{
 				memo->tag = tag;
-				memo->reach = light_reach(source[corner], stream->normals[vertex], !spot);
+				memo->reach = light_reach(source[corner], stream->normals[vertex], !cone_tex);
 				memo->camera_known = 0;
 			}
 			reach[corner] = memo->reach;
 			if (light_memo_check)
 			{
 				/* "lightmemocheck": worked out again and compared, bit for bit */
-				float again = light_reach(source[corner], stream->normals[vertex], !spot);
+				float again = light_reach(source[corner], stream->normals[vertex], !cone_tex);
 
 				if (memcmp(&again, &memo->reach, sizeof(again)))
 					light_memo_mismatches++;
@@ -20719,7 +21022,7 @@ static void psp_ge_light_draw_body(const void *vertices, int vertex_count, const
 	near_clip = near_saved;
 	if (!kept_count && !cut_count && !whole_count && !light_pieces.dropped)
 		return;
-	/* the light's colour, times the surface's average colour for a spotlight */
+	/* the light's colour, times the surface's average colour for a projected cone */
 	for (index = 0; index < 3; index++)
 	{
 		saved[index] = light.color[index];
@@ -20729,7 +21032,7 @@ static void psp_ge_light_draw_body(const void *vertices, int vertex_count, const
 		for (index = 0; index < kept_count * 3; index++)
 			out[index].color = light_color(*(float *)&out[index].color);
 	sceGuEnable(GU_TEXTURE_2D);
-	if (spot)
+	if (cone_tex)
 	{
 		cone = cone_texture(light.cosine_falloff, light.cosine_cutoff);
 		sceGuClutMode(GU_PSM_8888, 0, 0xFF, 0);
@@ -20915,7 +21218,7 @@ static void psp_ge_light_draw_body(const void *vertices, int vertex_count, const
 	world_model();
 	for (index = 0; index < 3; index++)
 		light.color[index] = saved[index];
-	if (spot)
+	if (cone_tex)
 		sceGuTexMapMode(GU_TEXTURE_COORDS, 0, 0);
 	sceGuFog(fog_near, fog_far, fog_color);
 	ge_blend(0);
@@ -22034,7 +22337,7 @@ static int blip_draw(float x, float y, float radius, float red, float green, flo
 
 void psp_ge_blip(float x, float y, float radius, float red, float green, float blue, unsigned int key)
 {
-	GE_PRETOUCH(key, TXPT_BLIP);
+	GE_PRETOUCH_HUD(key, TXPT_BLIP);
 	GE_DEFER(defer_words(DEFER_BLIP, 7, defer_bits(x), defer_bits(y), defer_bits(radius), defer_bits(red),
 		defer_bits(green), defer_bits(blue), key, 0));
 	GE_BENCH_SKIP();
@@ -22163,8 +22466,8 @@ static void blip_check_compare(void)
 
 void psp_ge_blips_end(float center_x, float center_y, float scale, unsigned int sweep_key, unsigned int mask_key)
 {
-	GE_PRETOUCH(sweep_key, TXPT_BLIPS_END);
-	GE_PRETOUCH(mask_key, TXPT_BLIPS_END);
+	GE_PRETOUCH_HUD(sweep_key, TXPT_BLIPS_END);
+	GE_PRETOUCH_HUD(mask_key, TXPT_BLIPS_END);
 	GE_DEFER(defer_words(DEFER_BLIPS_END, 5, defer_bits(center_x), defer_bits(center_y), defer_bits(scale), sweep_key,
 		mask_key, 0, 0, 0));
 	ge_kind(KIND_HUD);
@@ -23571,10 +23874,14 @@ static void frame_end_show(void)
 				copy_reserve_refused, heap_reserve_refused, arena_compactions, arena_moved_kb, arena_migrated);
 			carve_report();
 		}
-		platform_log("GE: widget sprites %lu (%lu begun, %lu untextured; %lu of %lu flare answers clear, %lu rays cast, %lu answers kept); change colour passes %lu, self-illumination %lu (%lu with glow maps, %lu clamped); meter palettes %lu worked out, %lu reused; model palettes %lu worked out, %lu reused; HUD quads %lu us a frame (with the see-through flush inside), characters %lu (picture changed %lu times)",
-			widget_sprites, widget_begins, widget_untextured, occlusion_visible, occlusion_tests, psp_occlusion_rays_cast, psp_occlusion_rays_kept, change_passes, glow_passes, glow_mapped, glow_clamped, meter_worked, meter_reused, multipurpose_worked, multipurpose_reused, hud_quad_us / (frames ? frames : 1), text_us / (frames ? frames : 1), text_changes);
+		platform_log("GE: widget sprites %lu (%lu begun, %lu untextured; %lu of %lu flare answers clear, %lu rays cast, %lu answers kept); change colour passes %lu (%lu left out, the map not resident), self-illumination %lu (%lu with glow maps, %lu clamped, %lu without a glow map: unlit); meter palettes %lu worked out, %lu reused; HUD quads %lu us a frame (with the see-through flush inside), characters %lu (picture changed %lu times)",
+			widget_sprites, widget_begins, widget_untextured, occlusion_visible, occlusion_tests, psp_occlusion_rays_cast, psp_occlusion_rays_kept, change_passes, change_unbound, glow_passes, glow_mapped, glow_clamped, glow_unmapped, meter_worked, meter_reused, hud_quad_us / (frames ? frames : 1), text_us / (frames ? frames : 1), text_changes);
 		platform_log("GE: flares hidden by the level alone %lu (their objects not tested); flarescheck: %lu answers compared, %lu differed",
 			psp_flare_walls_hidden, psp_flare_walls_checked, psp_flare_walls_differed);
+		if (reflection_words.specular > 0 || reflection_words.env_fp > 0 || reflection_words.env_near > 0 ||
+			reflection_words.chief_visor > 0)
+			platform_log("GE: reflections: %lu parts with a specular highlight, %lu reflection passes, %lu without their sphere map in memory; Chief's visor drawn %lu (%lu textured, %lu shiny, last %.0f pixels across)",
+				specular_parts, env_passes, env_unbound, visor_drawn, visor_textured, visor_shiny, visor_pixels);
 		if (PSP_DITHERSHIFT && dither_shift > 0)
 		{
 			platform_log("GE: %s: %lu passes dithered at a moved place", dither_shift == 2 ? "dithershiftall" : "dithershift", dither_moves);
@@ -23710,6 +24017,10 @@ static void frame_end_show(void)
 						all ? angle_triangles[6] * 100 / all : 0, overlay_wall_asks, overlay_on_walls, overlay_free, overlay_ask_us, overlay_backing_count, overlay_backing_full, nudges_asked, nudge_percent, nudges_clamped, nudges_edge_on,
 						nudge_wide > 0 ? " (nudgewide: not held)" : "");
 					nudges_asked = nudges_clamped = nudges_edge_on = 0;
+					if (overlay_no_room || overlay_no_room_skipped)
+						platform_log("GE: overlays without heap for their answers: %lu asks refused, %lu more not asked (overlaymemo%s), each drawn as on a wall",
+							overlay_no_room, overlay_no_room_skipped, overlay_memo > 0 ? "" : "off");
+					overlay_no_room = overlay_no_room_skipped = 0;
 					if (me_slant > 0)
 						platform_log("GE: meslant: %lu of %lu sorted draws split with the Media Engine, %lu triangles of %lu (%lu%%) bucketed there; %lu fell back to this CPU; meslantcheck: %lu triangles checked, %lu answers differing",
 							me_slant_split, me_slant_draws, me_slant_triangles, all, all ? me_slant_triangles * 100 / all : 0,

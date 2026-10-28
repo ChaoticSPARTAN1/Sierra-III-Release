@@ -44,7 +44,8 @@ Options:
                                 <output>/work/<map>.log
     --force                     bake maps whose hashes don't match
     --detail fp,vehicles        also bake _detail.ptex with these classes at
-                                full size (fp, weapons, vehicles, characters):
+                                full size (fp, weapons, vehicles, characters,
+                                chief):
                                 the launch menu's "assetdetail" uses them
     --sound s9                  the sound bake (the default; streaming.md S9):
                                 every sound at 22,050 Hz at most, effects mono,
@@ -91,7 +92,7 @@ Options:
                                 shows (its mask), not only its colour
 
 Nothing from the game is in this tool; it only converts the copy you own."""
-import argparse, concurrent.futures, hashlib, json, os, re, shutil, subprocess, sys, threading, time
+import argparse, concurrent.futures, hashlib, json, os, re, shutil, struct, subprocess, sys, threading, time, zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LIB = os.path.join(HERE, 'lib')
@@ -145,7 +146,9 @@ MULTIPLAYER_TAG_SPACE = '0x600000'
 # maps from the bundle before it wrongly: a pack's layout, Invader's flags or
 # tag space, or anything a release says needs a re-bake. Builds that read the
 # same format share a bake.
-BAKE_FORMAT = 1
+# 2 (b144): texture packs carry the change masks, the meters' RAM flag and
+# the averages (docs/design_b25_bake.md)
+BAKE_FORMAT = 2
 
 
 # maps bake side by side (--jobs): one line at a time, whole
@@ -254,6 +257,86 @@ def bake_chant(source, work, output):
         log('the chant: %s holds no chant this build knows; the loading screen will be silent' % xbe)
 
 
+TESTED_IMAGES = os.path.join(HERE, 'tested_images.json')
+XBE_REGIONS = {1: 'North America', 2: 'Japan', 4: 'Rest of the world', 0x80000000: 'Manufacturing'}
+
+
+def xbe_facts(path):
+    """the title's own record in default.xbe (its certificate): title id,
+    name, version, regions and disc number, or {} when it can't be read"""
+    try:
+        with open(path, 'rb') as f:
+            data = f.read()
+        if data[:4] != b'XBEH':
+            return {}
+        base, cert = struct.unpack_from('<I', data, 0x104)[0], struct.unpack_from('<I', data, 0x118)[0]
+        at = cert - base
+        title_id = struct.unpack_from('<I', data, at + 0x08)[0]
+        name = data[at + 0x0C:at + 0x0C + 80].decode('utf-16-le', 'replace').split('\0')[0]
+        regions = struct.unpack_from('<I', data, at + 0xA0)[0]
+        disc, version = struct.unpack_from('<II', data, at + 0xA8)
+        return dict(title_id='%08X' % title_id, title=name, version='%d' % version, disc='%d' % disc,
+                    regions=', '.join(v for k, v in XBE_REGIONS.items() if regions & k) or '0x%X' % regions)
+    except (OSError, struct.error):
+        return {}
+
+
+def fingerprint(source, work, map_digests, matched):
+    """what the bake was made from, logged and kept for the stamp: the disc
+    image's size and hashes (SHA-1, MD5 and CRC32 of the whole file, as the
+    disc-preservation databases list them), default.xbe's SHA-256 and its
+    title record, and how many of the maps were the retail ones this build
+    knows (hashes.json). It gates nothing: an image no one has tested still
+    bakes, and the stamp says so, so a player's report says which image it
+    came from. bake/tested_images.json lists the ones the releases were
+    tested with"""
+    fp = {}
+    if os.path.isdir(source):
+        fp['source'] = 'folder ' + os.path.basename(os.path.normpath(source))
+        xbe = next((c for c in (os.path.join(source, 'default.xbe'), os.path.join(source, '..', 'default.xbe'))
+                    if os.path.exists(c)), None)
+    else:
+        size = os.path.getsize(source)
+        fp['source'] = os.path.basename(source)
+        fp['image_size'] = '%d' % size
+        log('the disc image: fingerprinting %s (%d MB)' % (fp['source'], size >> 20))
+        sha1, md5, crc = hashlib.sha1(), hashlib.md5(), 0
+        with open(source, 'rb') as f:
+            for chunk in iter(lambda: f.read(1 << 22), b''):
+                sha1.update(chunk)
+                md5.update(chunk)
+                crc = zlib.crc32(chunk, crc)
+        fp['image_sha1'], fp['image_md5'], fp['image_crc32'] = sha1.hexdigest(), md5.hexdigest(), '%08x' % crc
+        xbe = None
+        with XIso(source) as iso:
+            listing = {p.lower(): p for p, n in iso.files()}
+            if 'default.xbe' in listing:
+                xbe = os.path.join(work, 'retail', 'default.xbe')
+                if not os.path.exists(xbe):
+                    iso.extract(listing['default.xbe'], xbe)
+    if xbe:
+        fp['xbe_sha256'] = sha256(xbe)
+        for key, value in xbe_facts(xbe).items():
+            fp['xbe_' + key] = value
+    fp['maps_retail'] = '%d of %d' % (matched, len(map_digests))
+    try:
+        tested = json.load(open(TESTED_IMAGES, encoding='utf-8')).get('images', [])
+    except (OSError, ValueError):
+        tested = []
+    known = next((t for t in tested if (fp.get('image_sha1') and t.get('image_sha1') == fp['image_sha1']) or
+                  (fp.get('xbe_sha256') and t.get('xbe_sha256') == fp['xbe_sha256'])), None)
+    fp['tested'] = ('yes: %s' % known.get('name', '?')) if known else 'no (not one the releases were tested with)'
+    log('the disc image: %s' % fp['source'])
+    for key in ('image_size', 'image_sha1', 'image_md5', 'image_crc32', 'xbe_sha256', 'xbe_title', 'xbe_title_id',
+                'xbe_version', 'xbe_regions', 'xbe_disc', 'maps_retail', 'tested'):
+        if key in fp:
+            log('  %-12s %s' % (key, fp[key]))
+    if not known:
+        log('  this image isn\'t one the releases were tested with: it still bakes; if anything looks wrong in play, '
+            'report the lines above with it')
+    return fp
+
+
 def bundle_label():
     """this bundle's short name for the stamp: the release's tag or the CI
     run's ref (bundle.txt, which assemble.py writes), else the commit of the
@@ -273,15 +356,18 @@ def bundle_label():
     return label or ('dev-' + commit[:7] if commit else 'unknown'), commit
 
 
-def write_stamp(output):
+def write_stamp(output, fp=None):
     """halo/bake.txt: the bake's format and the bundle that made it, which
-    the game checks at start (BAKE_FORMAT)"""
+    the game checks at start (BAKE_FORMAT), then what it was baked from
+    (fingerprint: the game reads only the format line)"""
     label, commit = bundle_label()
     path = os.path.join(output, 'halo', 'bake.txt')
     with open(path, 'w', encoding='utf-8', newline='\n') as f:
         f.write('# halo-psp-bake: the format of these maps, which the game checks at start\n'
                 'format: %d\nbundle: %s\ncommit: %s\nbaked: %s\n'
                 % (BAKE_FORMAT, label, commit or 'unknown', time.strftime('%Y-%m-%d %H:%M')))
+        for key, value in (fp or {}).items():
+            f.write('%s: %s\n' % (key, value))
     log('the stamp: %s (bake format %d, bundle %s)' % (path, BAKE_FORMAT, label))
 
 
@@ -378,7 +464,7 @@ def bake_map(name, retail, out_maps, work, track, keep_work, detail='', sound=''
     start = os.path.getsize(log_path)
     run([sys.executable, os.path.join(LIB, 'texpack.py'), final, os.path.join(out_maps, name + '.ptex')] + TEXPACK_OPTIONS,
         log_path, cwd=LIB, env=env)
-    echo_from(name, log_path, start, ('tint ', 'see-through shaders tinted', 'meter shader maps', 'HUD sheets', 'glow ', 'detail mask', 'quality ',
+    echo_from(name, log_path, start, ('tint ', 'see-through shaders tinted', 'meter shader maps', 'runtime reads', 'HUD sheets', 'glow ', 'detail mask', 'quality ',
                                 'kmeans compare summary', 'kmeans compare worse', 'bump relief') + MEASURES + ALPHA_LINES)
     # the main menu is the hardware's showcase (CLAUDE.md): a pack of its own
     # at the most the GE can take, beside the usual one ("noshowcase")
@@ -727,8 +813,10 @@ def main():
     if missing:
         log('not found in %s: %s' % (a.source, ', '.join(missing)))
     hashes = json.load(open(os.path.join(HERE, 'hashes.json')))
+    digests = {name: sha256(found[name]) for name in found}
+    fp = fingerprint(a.source, work, digests, sum(1 for n, d in digests.items() if hashes.get(n) == d))
     for name in list(found):
-        digest = sha256(found[name])
+        digest = digests[name]
         if hashes.get(name) and hashes[name] != digest:
             log('%s: not the retail map this build expects (sha256 %s...)%s' % (name, digest[:16],
                 '; baking anyway (--force)' if a.force else '; skipped (--force bakes it anyway)'))
@@ -736,7 +824,7 @@ def main():
                 del found[name]
     failures = bake_maps([m for m in wanted if m in found], found, out_maps, work, a)
     bake_chant(a.source, work, a.output)
-    write_stamp(a.output)
+    write_stamp(a.output, fp)
     if a.eboot:
         menu_eboot(a.eboot, a.music, music_source, a.output, work)
     if not a.keep_work:

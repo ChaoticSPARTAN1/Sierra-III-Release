@@ -155,6 +155,25 @@ static void report(const char *when)
 			psp_metrics_stick_reads[k] - m.stick_reads[k], (psp_metrics_stick_bytes[k] - m.stick_bytes[k]) / 1024,
 			(psp_metrics_stick_us[k] - m.stick_us[k]) / 1000.0);
 	platform_log("metrics io (%s, %s): %s; %s; %s", m.map, when, io[0], io[1], io[2]);
+	{
+		/* FIXES_COMPACTSKIP (memory_pool.c): since the program started */
+		extern unsigned int psp_compact_skipped, psp_compact_walked, psp_compact_check_moved;
+
+		extern unsigned int psp_gc_head_found, psp_gc_head_kept;
+
+		platform_log("metrics compact (%s, %s): pool compactions skipped (already compact) %u, walked %u, "
+			"blocks a skip would have left out of place %u; garbage collector's player heads found %u, kept %u",
+			m.map, when, psp_compact_skipped, psp_compact_walked, psp_compact_check_moved,
+			psp_gc_head_found, psp_gc_head_kept);
+	}
+	{
+		/* FIXES_SMALLWINS2 (structure_visibility.c): since the program started */
+		extern unsigned int psp_visrect_skipped, psp_visrect_check_kept;
+
+		platform_log("metrics smallwins2 (%s, %s): portal clips skipped (hulls' rectangles apart) %u; "
+			"of them not empty when clipped anyway (visrectcheck) %u",
+			m.map, when, psp_visrect_skipped, psp_visrect_check_kept);
+	}
 	if (m.heap_samples)
 		platform_log("metrics heap (%s, %s): free low %lu KB at game time %ld; largest block low %lu KB at game time %ld; in use peak %lu KB; "
 			"requests failed %lu; user memory free low %d KB (largest block %d KB); %lu samples, walk %lu us",

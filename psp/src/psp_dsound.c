@@ -111,6 +111,9 @@ struct psp_stream
 	/* "adpcmold": the header's sample left out and the padding nibble played,
 	as before (set with silent_overrun) */
 	int adpcm_old;
+	/* "memixold": the heard voice mixed by the per-sample loop, as before
+	(set with silent_overrun; mix_voice) */
+	int memix_old;
 	/* muffling: the I3DL2 source's high-frequency loss (obstruction,
 	occlusion, the direct path's own) as a one-pole low-pass, so a sound
 	behind a wall is duller as well as quieter, as on the Xbox. The main CPU
@@ -800,16 +803,18 @@ static int prepare_voice(struct psp_stream *stream)
 		extern int psp_keep(const char *name);
 		static int overrun = -1;
 
-		static int adpcm_old = -1;
+		static int adpcm_old = -1, memix_old = -1;
 
 		if (overrun < 0)
 		{
 			overrun = psp_keep("silentoverrun") != 0;
 			adpcm_old = psp_keep("adpcmold") != 0;
 			audio_old = psp_keep("audioold") != 0;
+			memix_old = psp_keep("memixold") != 0;
 		}
 		stream->silent_overrun = overrun;
 		stream->adpcm_old = adpcm_old;
+		stream->memix_old = memix_old;
 		if (audio_old || !game->has_3d)
 			stream->lowpass_coefficient = GAIN_ONE;
 		else if (game->hf_millibels != stream->lowpass_millibels || !stream->lowpass_coefficient)
@@ -839,10 +844,160 @@ static int prepare_voice(struct psp_stream *stream)
 	return 1;
 }
 
+/* the ME's cycle counter (coprocessor 0 register 9). Only the ME may read
+it: the main CPU runs in user mode, where the read faults. So it is read
+only through a split pointer, which only the ME's audio job passes */
+static inline unsigned int me_count(void)
+{
+	unsigned int count;
+
+	__asm__ __volatile__("mfc0 %0, $9" : "=r"(count));
+	return count;
+}
+
+/* a decoded block's frames, decoding it if its buffer holds another; with
+decode_cycles (the ME only), the decode's cycles are added to it */
+static inline const short *decoded_frames(struct psp_stream *stream, const struct voice_packet *packet, long block,
+	unsigned int *decode_cycles)
+{
+	if (block != stream->decoded_block[block & 1] || packet != stream->decoded_packet[block & 1])
+	{
+		if (decode_cycles)
+		{
+			unsigned int start = me_count();
+
+			decode_block(stream, packet, block);
+			*decode_cycles += me_count() - start;
+		}
+		else
+			decode_block(stream, packet, block);
+	}
+	return stream->decoded[block & 1];
+}
+
+/* MEMIX: a heard voice into output, the same integer steps as mix_voice's
+loop under "memixold", so the same samples and the same state after; only
+the work is less. The ME mixes every voice every 23 ms block, and what it
+spends here it can't spend on the draws it replays:
+- the position, its fraction and the decoded block's address stay in
+  registers through a run inside one packet, stored once at the run's end
+  (current_packet reads the position). In the old loop every sample loaded
+  and stored them through the record, and asked packet_frame twice where the
+  answer changes once in 64 frames;
+- a mono voice is the same sample on both sides until its gains (a mono
+  ADPCM block is decoded into both channels; a mono PCM frame is read twice),
+  so it is interpolated and filtered once. Only when the filter's two states
+  agree, which they do for any voice that has only ever been mono.
+"memixcheck" mixes each block both ways and counts any difference */
+static unsigned long mix_heard(struct psp_stream *stream, int *output, unsigned long frames, int left, int right,
+	int ramp_left, int ramp_right, int lowpass, int *lowpass_left_io, int *lowpass_right_io, unsigned int *decode_cycles)
+{
+	unsigned long done = 0, step = stream->step, channels = stream->channels;
+	int lowpass_left = *lowpass_left_io, lowpass_right = *lowpass_right_io;
+	int mono = channels == 1 && lowpass_left == lowpass_right;
+
+	while (done < frames)
+	{
+		struct voice_packet *packet = current_packet(stream);
+		unsigned long last, frame, fraction;
+		const short *pcm = NULL, *base = NULL;
+		long block = -1;
+
+		if (!packet)
+			break;
+		last = packet->frames - 1;
+		frame = stream->frame;
+		fraction = stream->fraction;
+		if (!stream->adpcm)
+			pcm = (const short *)packet->data;
+		while (done < frames && frame <= last)
+		{
+			const short *pair, *next = NULL;
+			int l0, r0, sample_left, sample_right;
+
+			if (pcm)
+			{
+				pair = pcm + frame * channels;
+				if (fraction && frame < last)
+					next = pair + channels;
+				l0 = pair[0];
+				r0 = pair[channels - 1];
+			}
+			else
+			{
+				if ((long)(frame >> 6) != block)
+				{
+					block = (long)(frame >> 6);
+					base = decoded_frames(stream, packet, block, decode_cycles);
+				}
+				pair = base + 2 * (frame & 63);
+				/* the next frame, in the other buffer past a block's end */
+				if (fraction && frame < last)
+					next = (frame & 63) != 63 ? pair + 2 : decoded_frames(stream, packet, block + 1, decode_cycles);
+				l0 = pair[0];
+				r0 = pair[1];
+			}
+			if (mono)
+			{
+				int sample = l0;
+
+				if (next)
+					sample = l0 + (((next[0] - l0) * ((int)fraction >> 1)) >> 15);
+				if (lowpass < GAIN_ONE)
+				{
+					lowpass_left += ((sample - lowpass_left) * lowpass) >> 14;
+					sample = lowpass_left;
+				}
+				else
+					lowpass_left = sample;
+				output[2 * done] += (sample * (left >> 8)) >> 14;
+				output[2 * done + 1] += (sample * (right >> 8)) >> 14;
+			}
+			else
+			{
+				sample_left = l0;
+				sample_right = r0;
+				if (next)
+				{
+					int l1 = next[0], r1 = pcm ? next[channels - 1] : next[1];
+
+					sample_left = l0 + (((l1 - l0) * ((int)fraction >> 1)) >> 15);
+					sample_right = r0 + (((r1 - r0) * ((int)fraction >> 1)) >> 15);
+				}
+				if (lowpass < GAIN_ONE)
+				{
+					lowpass_left += ((sample_left - lowpass_left) * lowpass) >> 14;
+					lowpass_right += ((sample_right - lowpass_right) * lowpass) >> 14;
+					sample_left = lowpass_left;
+					sample_right = lowpass_right;
+				}
+				else
+				{
+					lowpass_left = sample_left;
+					lowpass_right = sample_right;
+				}
+				output[2 * done] += (sample_left * (left >> 8)) >> 14;
+				output[2 * done + 1] += (sample_right * (right >> 8)) >> 14;
+			}
+			left += ramp_left;
+			right += ramp_right;
+			fraction += step;
+			frame += fraction >> 16;
+			fraction &= 0xFFFF;
+			done++;
+		}
+		stream->frame = frame;
+		stream->fraction = fraction;
+	}
+	*lowpass_left_io = lowpass_left;
+	*lowpass_right_io = mono ? lowpass_left : lowpass_right;
+	return done;
+}
+
 /* mixes one prepared voice into output (frames of stereo 32-bit sums);
 returns whether it played. Integers only, no calls out of this file: the
 Media Engine runs it (build 86) */
-static int mix_voice(struct psp_stream *stream, int *output, unsigned long frames)
+static int mix_voice(struct psp_stream *stream, int *output, unsigned long frames, unsigned int *decode_cycles)
 {
 	unsigned long step = stream->step, done = 0;
 	int target_left = stream->target_left, target_right = stream->target_right, left, right, ramp_left, ramp_right;
@@ -905,59 +1060,65 @@ static int mix_voice(struct psp_stream *stream, int *output, unsigned long frame
 		current_packet(stream);
 		return 0;
 	}
-	while (done < frames)
+	if (!stream->memix_old)
+		done = mix_heard(stream, output, frames, left, right, ramp_left, ramp_right, lowpass, &lowpass_left, &lowpass_right,
+			decode_cycles);
+	else
 	{
-		struct voice_packet *packet = current_packet(stream);
-		unsigned long last;
-
-		if (!packet)
-			break;
-		last = packet->frames - 1;
-		/* as many frames as stay inside this packet */
-		while (done < frames && stream->frame <= last)
+		while (done < frames)
 		{
-			int l0, r0, l1, r1, sample_left, sample_right;
-			int fraction = (int)stream->fraction;
+			struct voice_packet *packet = current_packet(stream);
+			unsigned long last;
 
-			packet_frame(stream, packet, stream->frame, &l0, &r0);
-			if (fraction && stream->frame < last)
+			if (!packet)
+				break;
+			last = packet->frames - 1;
+			/* as many frames as stay inside this packet */
+			while (done < frames && stream->frame <= last)
 			{
-				packet_frame(stream, packet, stream->frame + 1, &l1, &r1);
-				/* build 89: the fraction halved first. (l1 - l0) reaches
-				+-65535 and the fraction 65535, so the product overflowed 32
-				bits on loud, fast-changing sound at a pitch other than 1:
-				a full-scale click of the wrong sign (code review) */
-				sample_left = l0 + (((l1 - l0) * (fraction >> 1)) >> 15);
-				sample_right = r0 + (((r1 - r0) * (fraction >> 1)) >> 15);
+				int l0, r0, l1, r1, sample_left, sample_right;
+				int fraction = (int)stream->fraction;
+
+				packet_frame(stream, packet, stream->frame, &l0, &r0);
+				if (fraction && stream->frame < last)
+				{
+					packet_frame(stream, packet, stream->frame + 1, &l1, &r1);
+					/* build 89: the fraction halved first. (l1 - l0) reaches
+					+-65535 and the fraction 65535, so the product overflowed 32
+					bits on loud, fast-changing sound at a pitch other than 1:
+					a full-scale click of the wrong sign (code review) */
+					sample_left = l0 + (((l1 - l0) * (fraction >> 1)) >> 15);
+					sample_right = r0 + (((r1 - r0) * (fraction >> 1)) >> 15);
+				}
+				else
+				{
+					sample_left = l0;
+					sample_right = r0;
+				}
+				/* 16-bit samples: a difference under 2^16 times a Q14
+				coefficient stays inside 32 bits */
+				if (lowpass < GAIN_ONE)
+				{
+					lowpass_left += ((sample_left - lowpass_left) * lowpass) >> 14;
+					lowpass_right += ((sample_right - lowpass_right) * lowpass) >> 14;
+					sample_left = lowpass_left;
+					sample_right = lowpass_right;
+				}
+				else
+				{
+					/* so a filter that starts next block starts from the sound */
+					lowpass_left = sample_left;
+					lowpass_right = sample_right;
+				}
+				output[2 * done] += (sample_left * (left >> 8)) >> 14;
+				output[2 * done + 1] += (sample_right * (right >> 8)) >> 14;
+				left += ramp_left;
+				right += ramp_right;
+				stream->fraction += step;
+				stream->frame += stream->fraction >> 16;
+				stream->fraction &= 0xFFFF;
+				done++;
 			}
-			else
-			{
-				sample_left = l0;
-				sample_right = r0;
-			}
-			/* 16-bit samples: a difference under 2^16 times a Q14
-			coefficient stays inside 32 bits */
-			if (lowpass < GAIN_ONE)
-			{
-				lowpass_left += ((sample_left - lowpass_left) * lowpass) >> 14;
-				lowpass_right += ((sample_right - lowpass_right) * lowpass) >> 14;
-				sample_left = lowpass_left;
-				sample_right = lowpass_right;
-			}
-			else
-			{
-				/* so a filter that starts next block starts from the sound */
-				lowpass_left = sample_left;
-				lowpass_right = sample_right;
-			}
-			output[2 * done] += (sample_left * (left >> 8)) >> 14;
-			output[2 * done + 1] += (sample_right * (right >> 8)) >> 14;
-			left += ramp_left;
-			right += ramp_right;
-			stream->fraction += step;
-			stream->frame += stream->fraction >> 16;
-			stream->fraction &= 0xFFFF;
-			done++;
 		}
 	}
 	stream->lowpass_left = lowpass_left;
@@ -972,18 +1133,37 @@ static int mix_voice(struct psp_stream *stream, int *output, unsigned long frame
 sums (frames of stereo 32-bit sums); returns the voices heard, and whether
 any sample hit the 16-bit limit. The same code on either CPU: the main
 CPU's mix below, and the Media Engine's job (psp_meaudio.c). No library
-calls (the zeroing is a loop, not memset) */
+calls (the zeroing is a loop, not memset).
+split (the ME's audio job only; NULL on the main CPU): where the ME's cycles
+went, so its audio time can be taken apart on the PSP: [0] decoding, [1] the
+voices' mixing including their decoding, [2] zeroing the sums and writing
+the output, [3] voice-frames heard */
 __attribute__((optimize("no-tree-loop-distribute-patterns")))
-unsigned long psp_dsound_mix_list(void *const *list, unsigned long count, int *sums, short *output,
-	unsigned long frames, unsigned long *clipped)
+unsigned long psp_dsound_mix_split(void *const *list, unsigned long count, int *sums, short *output,
+	unsigned long frames, unsigned long *clipped, unsigned int *split)
 {
 	unsigned long sample, k, voices = 0;
+	unsigned int mark = split ? me_count() : 0, ends = 0;
 	int over = 0;
 
 	for (sample = 0; sample < frames * OUTPUT_CHANNELS; sample++)
 		sums[sample] = 0;
+	if (split)
+	{
+		unsigned int now = me_count();
+
+		ends += now - mark;
+		mark = now;
+	}
 	for (k = 0; k < count; k++)
-		voices += mix_voice((struct psp_stream *)list[k], sums, frames);
+		voices += mix_voice((struct psp_stream *)list[k], sums, frames, split ? &split[0] : NULL);
+	if (split)
+	{
+		unsigned int now = me_count();
+
+		split[1] += now - mark;
+		mark = now;
+	}
 	for (sample = 0; sample < frames * OUTPUT_CHANNELS; sample++)
 	{
 		int value = sums[sample];
@@ -992,8 +1172,19 @@ unsigned long psp_dsound_mix_list(void *const *list, unsigned long count, int *s
 			over = 1;
 		output[sample] = (short)(value > 32767 ? 32767 : value < -32768 ? -32768 : value);
 	}
+	if (split)
+	{
+		split[2] += ends + (me_count() - mark);
+		split[3] += voices * frames;
+	}
 	*clipped = over;
 	return voices;
+}
+
+unsigned long psp_dsound_mix_list(void *const *list, unsigned long count, int *sums, short *output,
+	unsigned long frames, unsigned long *clipped)
+{
+	return psp_dsound_mix_split(list, count, sums, output, frames, clipped, NULL);
 }
 
 /* ---------- the Media Engine's cache hand-over by ranges
@@ -1379,6 +1570,29 @@ static void edram_loss(const char *why)
 
 /* the game thread, every frame (sound_cache_idle): collect the copy job,
 start reads into free staging, hand what was read to the ME */
+/* SNDNOYIELD and the counts behind it (psp_fixups.py, FIXES_SOUNDEDRAM's
+request fixup): a request for a sound not yet loaded yields the thread only
+when its caller waits for it ("soundyieldold": every such request yields, as
+before); the counts say how often one yielded, and for how long */
+unsigned long psp_sound_request_yields = 0, psp_sound_request_yield_us = 0, psp_sound_request_unyielded = 0;
+
+int psp_sound_noyield(void)
+{
+	static int on = -1;
+
+	if (on < 0)
+		on = !psp_keep("soundyieldold");
+	return on;
+}
+
+void psp_sound_request_report(void)
+{
+	platform_log("sound requests: %lu yields of the thread for a sound not loaded yet, %lu us in them (%lu us each); %lu not yielded (SNDNOYIELD%s)",
+		psp_sound_request_yields, psp_sound_request_yield_us,
+		psp_sound_request_yields ? psp_sound_request_yield_us / psp_sound_request_yields : 0,
+		psp_sound_request_unyielded, psp_sound_noyield() ? "" : " off: soundyieldold");
+}
+
 void psp_sound_upload_poll(void)
 {
 	unsigned int k;
@@ -1603,13 +1817,80 @@ int psp_audio_setting(int set, int value)
 	return me_wanted && psp_meaudio_running();
 }
 
+/* "memixcheck": each block mixed by mix_voice's old loop and by MEMIX from
+the same voices, the outputs and the voices after compared; the block plays
+MEMIX's. On the main CPU only (the check keeps the block off the ME), and
+only for blocks of up to CHECK_VOICES voices */
+#define CHECK_VOICES 64
+static int memix_check = 0;
+static unsigned char *check_copies;
+static short check_output[MIX_FRAMES * OUTPUT_CHANNELS];
+static unsigned long check_blocks = 0, check_skipped = 0, check_output_differed = 0, check_state_differed = 0,
+	check_first_differed = 0;
+/* which of MEMIX's paths the checked voice blocks took: a check that never
+reached a path says nothing about it */
+static unsigned long check_mono = 0, check_stereo = 0, check_pcm = 0, check_filtered = 0, check_stepped = 0,
+	check_stepped_adpcm = 0;
+
+static unsigned long mix_checked(struct psp_stream **list, unsigned long count, int *sums, short *output,
+	unsigned long frames, unsigned long *clipped)
+{
+	unsigned char *before = check_copies, *after_old = check_copies + CHECK_VOICES * STREAM_BYTES;
+	unsigned long k, voices, voices_old, clipped_old, states = 0, differed;
+
+	if (count > CHECK_VOICES)
+	{
+		check_skipped++;
+		return psp_dsound_mix_list((void *const *)list, count, sums, output, frames, clipped);
+	}
+	for (k = 0; k < count; k++)
+	{
+		const struct psp_stream *voice = list[k];
+
+		memcpy(before + k * STREAM_BYTES, voice, sizeof(struct psp_stream));
+		list[k]->memix_old = 1;
+		if (voice->channels == 1 && voice->lowpass_left == voice->lowpass_right)
+			check_mono++;
+		else
+			check_stereo++;
+		check_pcm += !voice->adpcm;
+		check_filtered += voice->lowpass_coefficient < GAIN_ONE;
+		/* a pitch other than the output's interpolates; in ADPCM it reads
+		across each 64-frame block's end into the other buffer */
+		check_stepped += voice->step != 0x10000;
+		check_stepped_adpcm += voice->step != 0x10000 && voice->adpcm;
+	}
+	voices_old = psp_dsound_mix_list((void *const *)list, count, sums, check_output, frames, &clipped_old);
+	for (k = 0; k < count; k++)
+	{
+		memcpy(after_old + k * STREAM_BYTES, list[k], sizeof(struct psp_stream));
+		memcpy(list[k], before + k * STREAM_BYTES, sizeof(struct psp_stream));
+		list[k]->memix_old = 0;
+	}
+	voices = psp_dsound_mix_list((void *const *)list, count, sums, output, frames, clipped);
+	for (k = 0; k < count; k++)
+	{
+		((struct psp_stream *)(after_old + k * STREAM_BYTES))->memix_old = 0;
+		if (memcmp(after_old + k * STREAM_BYTES, list[k], sizeof(struct psp_stream)))
+			states++;
+	}
+	check_blocks++;
+	check_state_differed += states != 0;
+	differed = voices != voices_old || *clipped != clipped_old ||
+		memcmp(output, check_output, frames * OUTPUT_CHANNELS * sizeof(short)) != 0;
+	check_output_differed += differed;
+	if ((states || differed) && !check_first_differed)
+		check_first_differed = check_blocks;
+	return voices;
+}
+
 static void mix(short *output, unsigned long frames)
 {
 	static int sums[MIX_FRAMES * OUTPUT_CHANNELS] __attribute__((aligned(64)));
 	static struct psp_stream *list[VOICE_LIST_MAX];
 	struct psp_stream *stream;
 	unsigned long voices = 0, count = 0, clipped = 0, me_us = 0, sc_us;
-	int on_me = me_wanted && psp_meaudio_running(), mixed = 0;
+	int on_me = me_wanted && psp_meaudio_running() && !memix_check, mixed = 0;
 	SceUInt64 start = sceKernelGetSystemTimeWide();
 
 	blocks_begun++;
@@ -1698,7 +1979,10 @@ static void mix(short *output, unsigned long frames)
 	{
 		if (edram_unreachable(0))
 			mute_cache_voices(list, count);
-		voices = psp_dsound_mix_list((void *const *)list, count, sums, output, frames, &clipped);
+		if (memix_check)
+			voices = mix_checked(list, count, sums, output, frames, &clipped);
+		else
+			voices = psp_dsound_mix_list((void *const *)list, count, sums, output, frames, &clipped);
 	}
 	{
 		unsigned long k;
@@ -1876,6 +2160,13 @@ static void audio_start(void)
 
 		/* before the audio thread or any stream exists: nothing reads it earlier */
 		mixlock_old = psp_keep("mixlockold") != 0;
+		if (psp_keep("memixcheck"))
+		{
+			check_copies = memalign(64, 2 * CHECK_VOICES * STREAM_BYTES);
+			memix_check = check_copies != NULL;
+		}
+		platform_log("audio: heard voices mixed %s%s", psp_keep("memixold") ? "by the per-sample loop, as before (memixold)" : "with the position in registers and mono voices once (MEMIX)",
+			memix_check ? "; memixcheck: each block mixed both ways on the main CPU" : psp_keep("memixcheck") ? "; memixcheck: no room for its copies, off" : "");
 		platform_log("audio: the mixer's lock %s", mixlock_old ? "held through the Media Engine's job, as before (mixlockold)" : "not held across the job: the game's side is on cache lines of its own, its changes reach the mix by a ring (MIXLOCK)");
 	}
 	/* above the game's thread, which it interrupts for a moment every 23 ms */
@@ -1900,6 +2191,13 @@ void psp_audio_report(void)
 		platform_log("audio: Media Engine mixed %lu of the blocks (menu: %s), waited for %lu us a block on average, %lu at most (main CPU asleep meanwhile); %lu failed; %lu over the voice list; %lu handed over by ranges (the rest by the whole cache)",
 			me_blocks, me_wanted ? "ME" : "main CPU", me_blocks ? me_wait_us / me_blocks : 0, me_wait_worst_us, me_failures,
 			me_overflows, ranges_blocks);
+	if (memix_check)
+	{
+		platform_log("audio: memixcheck: %lu blocks mixed both ways (%lu with more than %d voices not checked): outputs differed in %lu, the voices after in %lu (first at block %lu)",
+			check_blocks, check_skipped, CHECK_VOICES, check_output_differed, check_state_differed, check_first_differed);
+		platform_log("audio: memixcheck: voice blocks by path: mono %lu, stereo or unequal filters %lu, PCM %lu, filtered %lu, interpolated %lu (ADPCM, across block ends: %lu)",
+			check_mono, check_stereo, check_pcm, check_filtered, check_stepped, check_stepped_adpcm);
+	}
 	platform_log("audio: of %lu voice blocks, muffled %lu, pitch moved by Doppler %lu, quieter outside a cone %lu%s",
 		fx_prepared, fx_muffled, fx_shifted, fx_coned, audio_old > 0 ? " (audioold: all off)" : "");
 	platform_log("audio: the game waited for the mixer's lock %lu times, %lu us in all, %lu at most; voices that ran dry and were then fed more (a gap heard) %lu, %lu ms of silence in all, the longest %lu ms",
@@ -1951,9 +2249,13 @@ void psp_audio_report(void)
 (about 743 ms), and its packet callbacks topped them up at interrupt time; the
 port tops them up only once a frame (DirectSoundDoWork from sound_render), so
 a frame longer than the queue (a checkpoint save, a log close) left long sounds
-silent. The packets point into the sound cache, so a deeper queue costs no
-memory. "streampacketsN" sets N (2-32); "streampackets4" is the Xbox's depth */
-#define STREAM_PACKETS_DEFAULT 16
+silent. A packet is ~186 ms (2,304 bytes of ADPCM at 22 kHz), so 8 cover ~1.5 s.
+A deeper queue isn't free: each packet queued holds its sound in the sound
+cache, and at 16 the pieces queued ahead (a cutscene's music, the next loop)
+held so much that the cache refused other sounds for room, Cortana's lines
+among them (B33). "streampacketsN" sets N (2-32); "streampackets4" is the
+Xbox's depth */
+#define STREAM_PACKETS_DEFAULT 8
 int psp_stream_packets(void)
 {
 	extern int psp_keep_number(const char *prefix, int fallback);
