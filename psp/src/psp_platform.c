@@ -2153,11 +2153,16 @@ void psp_me_sleep_stop(void);
 void psp_me_wake_request(void);
 void psp_ge_inflight_room_suspend(void);
 void psp_ge_inflight_room_resume(void);
+int psp_sleepguard_quiet(void);
+void psp_sleepguard_woken(void);
 
 static int power_callback(int unknown, int flags, void *argument)
 {
 	(void)unknown; (void)argument;
-	if (flags & PSP_POWER_CB_SUSPENDING)
+	/* B41: a sleep halo_sleep.prx put off was readied by the game thread
+	itself, at a frame end (psp_sleepguard.c); this half is for a sleep that
+	didn't wait (no module, or the firmware's own, as on a flat battery) */
+	if ((flags & PSP_POWER_CB_SUSPENDING) && !psp_sleepguard_quiet())
 	{
 		/* the Media Engine stopped before the sleep: the main CPU runs its
 		jobs until the wake's restart has it answering again */
@@ -2187,6 +2192,8 @@ static int power_callback(int unknown, int flags, void *argument)
 		/* not here: this thread can't know the game's threads are out of
 		the ME's jobs. The main thread's next frame end starts it */
 		psp_me_wake_request();
+		/* the game thread, waiting in psp_sleepguard_frame, goes on */
+		psp_sleepguard_woken();
 	}
 	return 0;
 }
@@ -4071,6 +4078,13 @@ int main(int argc, char **argv)
 	scePowerSetClockFrequency(333, 333, 166);
 
 	load_crash_handler(argc > 0 ? argv[0] : NULL);
+	{
+		/* halo_sleep.prx is beside the EBOOT (psp_sleepguard.c; loaded once
+		keep.txt is read) */
+		extern void psp_sleepguard_eboot(const char *path);
+
+		psp_sleepguard_eboot(argc > 0 ? argv[0] : NULL);
+	}
 
 	setenv("HALO_DATA_ROOT", DATA_ROOT, 1);
 	setenv("HALO_SAVE_ROOT", DATA_ROOT "/save", 1);
