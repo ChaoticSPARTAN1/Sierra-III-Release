@@ -56,14 +56,27 @@ Options:
     --music [MAP:]TAG[@START][+LENGTH]
                                 which clip (default MUSIC below; MAP: ui)
     --list-music                list the maps' music tags and lengths, and stop
+    --music-loop-previews       with --list-music: the menu sound's loops
+                                (the game's own loop and the best 30 s cuts,
+                                each looped three times) in
+                                <output>/music-previews
+    --music-previews            with --list-music: each tag's first 30 s as a
+                                .wav in <output>/music-previews, to listen to
+                                (the disc's music: keep it on this computer)
     --tints-from-means          the see-through shaders' tints from every
                                 map's mean, on the runtime's own map, as
                                 the packs were before (lib/seethrough.py)
-    --no-cache                  make every palette afresh: by default a
-                                palette made once is kept (<output>/work/
-                                palettes) for the textures that repeat in
-                                the asset track's pack and in other maps.
-                                The maps come out the same either way
+    --cache-dir DIR             where palettes and re-encoded sounds are kept
+                                between bakes (default: your user cache
+                                folder, halo-psp-bake: %LOCALAPPDATA% on
+                                Windows, ~/Library/Caches on macOS,
+                                ~/.cache on Linux). A later bake reads back
+                                what it would make again, so a re-bake after
+                                a new release takes minutes; deleting the
+                                folder is always safe
+    --no-cache                  make every palette and sound afresh, and keep
+                                nothing between bakes. The maps come out the
+                                same either way
     --fast-palettes             palettes found sooner, not the same ones
                                 (texpack.py --fast-palettes; on trial)
     --profile                   log each texture's class, size and seconds
@@ -126,9 +139,11 @@ DEFAULT = CAMPAIGN + ['ui']
 # subtitle data, AI squads' unused fields, firing positions' padding: ~0.5 MiB
 # a campaign map, and what lets b40 fit). Maps built with -Z need build 108 or
 # later; build 108 still loads older ones (psp_tag_layouts.c)
-# The XMB menu's sound: [MAP:]TAG[@START][+LENGTH] (snd0.py). Not chosen yet;
-# `--list-music` shows the candidates.
-MUSIC = ''
+# The XMB menu's sound: [MAP:]TAG[@START][+LENGTH][#loop[X]] (snd0.py).
+# "A Walk in the Woods" (the maintainer's pick, 2026-10-28, by ear): its
+# loop's variation 1 (the chain from permutation 1, 38.4 s), which the XMB
+# repeats seamlessly. `--list-music` shows the candidates
+MUSIC = 'b30:levels\\b30\\music\\b30_01#loopc1'
 BUILD_FLAGS = ['-g', 'xbox-ntsc', '-X', '0x09600000', '-U', '-l', '0', '-H', '-K', '0.25,0.003',
                '-M', '-Y', '512', '-D', '-Z']
 # the tag window a map is built for (-T; psp_capacity.h's PSP_TAG_CACHE_SIZE):
@@ -380,6 +395,37 @@ def scenario_path(map_path, log_path):
     return path
 
 
+SOUND_CACHE = ''   # the cache's sounds folder, when there is one
+
+
+def default_cache_root():
+    """the user's own cache folder for this bake (HALO_PSP_BAKE_CACHE, the
+    checks' override, first)"""
+    if os.environ.get('HALO_PSP_BAKE_CACHE'):
+        return os.environ['HALO_PSP_BAKE_CACHE']
+    if os.name == 'nt':
+        base = os.environ.get('LOCALAPPDATA') or os.path.join(os.path.expanduser('~'), 'AppData', 'Local')
+    elif sys.platform == 'darwin':
+        base = os.path.join(os.path.expanduser('~'), 'Library', 'Caches')
+    else:
+        base = os.environ.get('XDG_CACHE_HOME') or os.path.join(os.path.expanduser('~'), '.cache')
+    return os.path.join(base, 'halo-psp-bake')
+
+
+def cache_summary(root):
+    counts, size = {}, 0
+    for kind in ('palettes', 'sounds'):
+        folder = os.path.join(root, kind)
+        names = os.listdir(folder) if os.path.isdir(folder) else []
+        counts[kind] = len(names)
+        for n in names:
+            try:
+                size += os.path.getsize(os.path.join(folder, n))
+            except OSError:
+                pass
+    return '%d palettes, %d sounds, %.0f MB' % (counts['palettes'], counts['sounds'], size / 2 ** 20)
+
+
 def tool_env():
     """the bundle's tools are linked statically, so they need no library
     path; the scripts get the bundle's lib and Invader's definitions"""
@@ -426,7 +472,8 @@ def bake_map(name, retail, out_maps, work, track, keep_work, detail='', sound=''
     scenario = scenario_path(os.path.join(folder, 'maps_in', name + '.map'), log_path)
     if sound:
         log('%s: sounds re-encoded (%s)' % (name, sound))
-        run([sys.executable, os.path.join(LIB, 'soundpack.py'), os.path.join(folder, 'tags'), sound], log_path, env=env)
+        run([sys.executable, os.path.join(LIB, 'soundpack.py'), os.path.join(folder, 'tags'), sound]
+            + ([SOUND_CACHE] if SOUND_CACHE else []), log_path, env=env)
         summary = [line for line in open(log_path, errors='replace') if line.startswith('soundpack ')]
         if summary:
             log('%s: %s' % (name, summary[-1].strip()))
@@ -681,8 +728,10 @@ def main():
     ap.add_argument('output', help='where the halo/maps folder is written')
     ap.add_argument('--maps', default='', help='comma-separated map names (default: the campaign\'s and ui)')
     ap.add_argument('--multiplayer', action='store_true', help='the multiplayer maps too')
+    ap.add_argument('--cache-dir', default='',
+                    help='where palettes and sounds are kept between bakes (default: the user cache folder)')
     ap.add_argument('--no-cache', action='store_true',
-                    help='make every palette afresh (the maps come out the same either way)')
+                    help='make every palette and sound afresh, and keep nothing (the maps come out the same either way)')
     ap.add_argument('--fast-palettes', action='store_true', help='palettes found sooner, not the same ones (on trial)')
     ap.add_argument('--profile', action='store_true', help="log each texture's class, size and seconds, and a summary")
     ap.add_argument('--compare-palettes', action='store_true',
@@ -695,6 +744,8 @@ def main():
     ap.add_argument('--eboot', default='')
     ap.add_argument('--music', default=MUSIC)
     ap.add_argument('--list-music', action='store_true')
+    ap.add_argument('--music-previews', action='store_true')
+    ap.add_argument('--music-loop-previews', action='store_true')
     ap.add_argument('--tints-from-means', action='store_true')
     # --no-clut-look: the same, for option checks that take letters only
     ap.add_argument('--no-clut4-look', '--no-clut-look', dest='no_clut4_look', action='store_true',
@@ -783,13 +834,21 @@ def main():
     out_maps = os.path.join(a.output, 'halo', 'maps')
     work = os.path.join(a.output, 'work')
     os.makedirs(out_maps, exist_ok=True)
-    # one palette cache for every pack of every map in this bake, emptied
-    # first: a bake never reads palettes another bake left
-    palettes = os.path.abspath(os.path.join(work, 'palettes'))
-    shutil.rmtree(palettes, ignore_errors=True)
+    # one cache for every map of every bake: palettes (texpack.py) and
+    # re-encoded sounds (soundpack.py), each kept by a hash of its exact
+    # input and of the code that makes it, so what a later bake reads back
+    # is what it would have made (the same bytes: a warm bake checked
+    # against a cold one, file for file)
+    global SOUND_CACHE
     if not a.no_cache and not a.list_music:
-        os.makedirs(palettes)
+        root = os.path.abspath(a.cache_dir or default_cache_root())
+        palettes = os.path.join(root, 'palettes')
+        SOUND_CACHE = os.path.join(root, 'sounds')
+        os.makedirs(palettes, exist_ok=True)
+        os.makedirs(SOUND_CACHE, exist_ok=True)
         TEXPACK_OPTIONS.extend(['--palette-cache', palettes])
+        log('cache: %s (%s); a re-bake reads back what it would make again, and deleting the folder is safe'
+            % (root, cache_summary(root)))
     if a.eboot and not os.path.isfile(a.eboot):
         sys.exit('halo-psp-bake: --eboot %s: no such file' % a.eboot)
     # said at the start, so a long bake doesn't end in a surprise (and again
@@ -804,6 +863,18 @@ def main():
     if a.list_music:
         r = subprocess.run([sys.executable, os.path.join(LIB, 'snd0.py'), 'list'] + [found[m] for m in wanted if m in found],
                            env=tool_env())
+        if a.music_loop_previews and r.returncode == 0:
+            music_map, clip = music_spec(a.music or MUSIC)
+            if music_map in found:
+                subprocess.run([sys.executable, os.path.join(LIB, 'snd0.py'), 'inspect', found[music_map],
+                                clip.partition('#')[0].partition('@')[0].partition('+')[0]], env=tool_env())
+                r = subprocess.run([sys.executable, os.path.join(LIB, 'snd0.py'), 'loops', found[music_map],
+                                    clip.partition('#')[0].partition('@')[0].partition('+')[0],
+                                    os.path.join(a.output, 'music-previews')], env=tool_env())
+        if a.music_previews and r.returncode == 0:
+            r = subprocess.run([sys.executable, os.path.join(LIB, 'snd0.py'), 'previews',
+                                os.path.join(a.output, 'music-previews')] + [found[m] for m in wanted if m in found],
+                               env=tool_env())
         if not a.keep_work:
             shutil.rmtree(os.path.join(work, 'retail'), ignore_errors=True)
         sys.exit(r.returncode)
@@ -829,7 +900,9 @@ def main():
         menu_eboot(a.eboot, a.music, music_source, a.output, work)
     if not a.keep_work:
         shutil.rmtree(os.path.join(work, 'retail'), ignore_errors=True)
-        shutil.rmtree(palettes, ignore_errors=True)
+    if SOUND_CACHE:
+        root = os.path.dirname(SOUND_CACHE)
+        log('cache: %s now holds %s' % (root, cache_summary(root)))
     log('baked %d of %d maps into %s%s' % (len(found) - len(failures), len(wanted), out_maps,
         '; failed: ' + ', '.join(failures) if failures else ''))
     log('copy %s to the root of the Memory Stick (it holds maps/)' % os.path.join(a.output, 'halo')

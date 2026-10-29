@@ -122,6 +122,9 @@ data; the CPU reads its palette (the meters), so it's kept in main RAM, which
 the Media Engine can reach */
 #define CHANGE_MASK 8
 #define CPU_READS 16
+/* Chief's multipurpose maps: their reflection mask's CLUT just before the
+change mask's (psp_tex_reflection_mask) */
+#define REFL_MASK 32
 /* the light gels' six face colours (psp_tex_gel_faces) */
 #define GEL_FACES_MARK 0xFACE
 #define GEL_FACES_KEPT 16
@@ -2451,6 +2454,19 @@ const void *psp_tex_change_mask(unsigned int key, int *count)
 		return NULL;
 	*count = entries[index].psm == GU_PSM_T4 ? 16 : 256;
 	return (const void *)(resident_at[index] + entries[index].size - *count * 4);
+}
+
+/* a resident multipurpose map's reflection mask (texpack.py,
+reflection_mask): the CLUT just before its change mask, for Chief's sheen
+pass; NULL when the map isn't resident or the pack keeps none for it */
+const void *psp_tex_reflection_mask(unsigned int key, int *count)
+{
+	int index = key && entries ? find(key) : -1;
+
+	if (index < 0 || !resident_at[index] || !(entries[index].flags & REFL_MASK) || !(entries[index].flags & CHANGE_MASK))
+		return NULL;
+	*count = entries[index].psm == GU_PSM_T4 ? 16 : 256;
+	return (const void *)(resident_at[index] + entries[index].size - *count * 8);
 }
 
 /* a texture's average once worked out, even after it has left memory;

@@ -46,6 +46,7 @@ PSP_HEAP_SIZE_KB(PSP_HEAP_KB);
 /* ms0:/halo, or the multiplayer build's ms0:/halomp (psp_paths.h) */
 #include "psp_paths.h"
 #include "psp_metrics.h"
+#include "psp_lanetrace.h"
 #define DATA_ROOT PSP_DATA_ROOT
 /* in a folder of its own: the game's own files (debug.txt, stderr.txt,
 gamestate.txt) are written next to each other in ms0:/halo, and a file's
@@ -615,6 +616,17 @@ windows and the per-type object lines then read 0; the heartbeat's frame and
 tick times stay. Set when keep.txt is read */
 int psp_timers_off = 0;
 
+#if defined(PSP_RECON) && defined(PSP_TICK_STEPS)
+/* "objsteps" (below): each step's time charged to the object being updated
+or drawn as well */
+static int objsteps_depth = 0;
+static unsigned long objsteps_frames = 0, objsteps_timed_frames = 0;
+static void objsteps_charge(const char *step, unsigned int microseconds);
+#define OBJSTEPS_CHARGE(step, microseconds) do { if (objsteps_depth > 0) objsteps_charge(step, microseconds); } while (0)
+#else
+#define OBJSTEPS_CHARGE(step, microseconds) do { } while (0)
+#endif
+
 /* at each frame's end: whether the next frame's steps are timed. The step
 running across the edge is closed or opened here, so each timed frame's
 time is all charged and an untimed frame's none */
@@ -623,6 +635,11 @@ static void steps_frame_edge(void)
 	int next = ++steps_frame % steps_every == 0;
 	unsigned int now;
 
+#if defined(PSP_RECON) && defined(PSP_TICK_STEPS)
+	objsteps_frames++;
+	if (steps_timed)
+		objsteps_timed_frames++;
+#endif
 	steps_window_frames++;
 	if (next)
 		steps_window_timed++;
@@ -635,6 +652,7 @@ static void steps_frame_edge(void)
 
 		slot->microseconds += now - profile_last_time;
 		slot->calls++;
+		OBJSTEPS_CHARGE(profile_last_name, now - profile_last_time);
 	}
 	profile_last_name = next ? last_step : NULL;
 	profile_last_time = now;
@@ -667,6 +685,7 @@ void psp_step(const char *name)
 
 			slot->microseconds += now - profile_last_time;
 			slot->calls++;
+			OBJSTEPS_CHARGE(profile_last_name, now - profile_last_time);
 		}
 		profile_last_name = name;
 		profile_last_time = now;
@@ -1013,6 +1032,8 @@ static void object_report(SceUID file, unsigned long ticks)
 /* build 106: rasterizer.c's model part draws (object_report) */
 unsigned long psp_model_draw_us[3];
 
+void psp_sleepguard_start(void);
+
 /* ---------- what the null path keeps (build 19). With the GE drawing, the
 old Direct3D path's shadows, see-through parts, particles, decals, HUD and
 texture loads cost CPU time and draw nothing, and render interpolation
@@ -1025,7 +1046,7 @@ no more): a preset with the menu's own words needs ~250, and words past the
 limit are lost silently. KEEP_DEFAULTS_ROOM more holds the campaign's
 default words (keep_defaults_add), however full the file is */
 #define KEEP_FILE_BYTES 509
-#define KEEP_DEFAULTS_ROOM 192
+#define KEEP_DEFAULTS_ROOM 256
 static char keep_words[KEEP_FILE_BYTES + 3 + KEEP_DEFAULTS_ROOM] = "";
 /* build 106: bumped whenever keep_words changes, so psp_keep's remembered
 answers are asked again */
@@ -1079,6 +1100,12 @@ static const struct
 	/* Chief's visor drawn gold from its own sphere map (psp_ge.c, chiefvisor):
 	folded into the lighting it stayed near black; a restoration */
 	{ "chiefvisor", "nochiefvisor" },
+	/* Chief's armour as the Xbox draws it: its reflection added over the lit,
+	change-coloured base where the multipurpose map marks it (psp_ge.c,
+	chiefsheen), and its detail map over textures kept at their own size
+	(chiefdetail; texpack.py bakes Chief at full size by default); restorations */
+	{ "chiefsheen", "nochiefsheen" },
+	{ "chiefdetail", "nochiefdetail" },
 	/* the frame handed to the ME in pieces as it is written, gated on the main
 	CPU's wait for the ME (psp_ge.c, mechunk): where the frame waits for the
 	ME the replay runs beside the writing (a30 7.7 -> 12.7 fps, d20 11.4 ->
@@ -1178,6 +1205,9 @@ static void keep_load(void)
 		keep_cache_lock = sceKernelCreateSema("halo keep cache", 0, 1, 1, NULL);
 	platform_log("null path keeps:%s(keep.txt; skipped otherwise: transparent particles textures interpolation; also: noshadows nodecals nodetail nocull cullflip nooverlays fullparticles novfpu hwprofile hud100 hud115 hud130 hud145 hud160 hudnopush vehiclesawake flaresexact nohud noparticles fulllod awake sleepdebug audiodump savetest menutest ...)",
 		strlen(keep_words) > 2 ? keep_words : " nothing ");
+	/* B41's stopgap (psp_sleepguard.c): the sleep switch held off, once
+	the keep words can say otherwise */
+	psp_sleepguard_start();
 	/* build 89: in two lines (the one line passed the log's 512 characters) */
 	platform_log("keep words, continued: vramlargest clearmagenta nomip listuncached stalleach near2 near4 mipbias1 mipbias2 decaloffset passes overlayoffset decalbig detailbias15 detailbias2 decalall detailnear mipauto detailauto noangle visdump modeldrop overlaynoslope overlaynowall overlayslope1 overlayslope4 overlayfreefar skydump flatshade tdump");
 	platform_log("keep words, continued: nearauto walldump decalnoslope vblankthrottle noboxtest detailallfar verifytags texsqueeze texvramonly colltest geoasync nudgewide decalbatch menushot geserial vramcold uvwide nooverlay meaudio nomeaudio benchrun levelcompact meclassify noskincut novblankthrottle");
@@ -1207,7 +1237,7 @@ static void keep_load(void)
 	platform_log("keep words, build 122's behaviour calls (opt-in, for an A/B): aihalf aihalfdistN aihalfview; campaign only: machinesfar posehalf");
 	platform_log("keep words, compromises: lodpspoff (models' detail picked at the PSP's size, not 1.76x nearer; on by default, lodpsp still accepted), lodpspall (the nearer pick with no floor for models whose lower levels lose a part); recon: lodpspscan (every model's floor logged as a map's first model is drawn)");
 	platform_log("keep words, compromises (opt-in, for an A/B): campaign only: aicad2 (each actor thinks on every other tick, staggered), aicad3 (the same, the timeslice at full rate); recon: aioutcome");
-	platform_log("keep words, the Media Engine's wake: opt-in: mewake (the ME started again after a sleep; mewakeoff wins over it); fix off: meresetwhole (the reset register written whole); recon: mewaketest; test: mebcc1 (the ME unit word m-cid finds fastest)");
+	platform_log("keep words, the Media Engine's wake: opt-in: mewake (the ME started again after a sleep; mewakeoff wins over it), mewakeearly (with mewake: released in the kernel's wake handler, not at a frame end), mewakeprobe (with mewake: at the restart the ME tries each kind of job work before its loop, marked step by step), mewakefw (with mewake: the restart lets go of the AVC and AW resets launch found let go); fix off: meresetwhole (the reset register written whole); recon: mewaketest; test: mebcc1 (the ME unit word m-cid finds fastest)");
 	platform_log("keep words, the level given from an origin near the eye: restoration off: levellocaloff (the level's copies from the world's origin, as before); instrument (opt-in): geprecision (the GE's precision measured as the first frame begins: the log's geprecision lines)");
 	platform_log("keep words, see-through as the Xbox draws it: restorations off: nolevelglow (the level's self-illumination pass), seethroughpush (the port's depth nudges for surfaces that aren't decals), seethroughwrap (every map repeated), waterunfogged (added water unfogged); look call (opt-in): ditherhalf, ditherlift on by default (offsets +4; noditherlift turns it off), dithershift (detail and sky passes dithered, the pattern moved each pass) dithershiftall (every blend); recon: noglowpass nobackpass ditherprobe (the GE's rounding, logged at start-up)");
 	platform_log("keep words, build 126's: speed off: pathclearfull (a path search's whole state cleared before it, RV2), deletedwalkall (a deleted object's fix-up walks every object, RV1), aipathold (the nearby firing positions test searches first, smoothing scans from the first, RV4); checks: pathclearpoison deletedcheck aipathcheck; restorations off: weaponstateold (the HUD's weapon state left as the stack held it, RB1), aimchangeold (a still unit with no aiming limit at full aiming change, RH1)");
@@ -1550,6 +1580,254 @@ void psp_objcost(long definition, int type, int drawing, unsigned long microseco
 	}
 }
 
+#ifdef PSP_TICK_STEPS
+/* "objsteps" (R1 builds: PSP_TICK_STEPS=1 PSP_RECON=1; timemap's request,
+lab psp/sierra/timemap/objsteps_request.md): each step's time charged to
+the object definition being updated or drawn as well as to the step, so the
+profile says what a grunt's tick or a flying Pelican's goes on. The object
+is a stack: object_update pushes itself on entry and pops on exit, so a
+rider updated inside its vehicle is charged to itself; render_object's call
+does the same for drawing. A push or pop closes the step's interval so far
+(charged to the object below), so each microsecond goes to the object whose
+code ran it. Cells are (definition, step, update or draw): 128 definitions,
+the last for any past them, and 48 steps, the last for any past them, in
+microseconds of the timed frames, scaled up as the profile's are. Cleared
+each profile window and at each map load (definition indices are a map's) */
+#define OBJSTEPS_DEFINITIONS 128
+#define OBJSTEPS_STEPS 48
+#define OBJSTEPS_DEPTH 8
+static int objsteps_on = -1;
+static struct { long definition; int drawing; } objsteps_stack[OBJSTEPS_DEPTH];
+static long objsteps_definition[OBJSTEPS_DEFINITIONS];
+static signed char objsteps_type[OBJSTEPS_DEFINITIONS];
+static const char *objsteps_step[OBJSTEPS_STEPS];
+static unsigned long (*objsteps_us)[OBJSTEPS_STEPS][2] = NULL; /* [OBJSTEPS_DEFINITIONS], from the heap */
+static unsigned long objsteps_deep = 0;
+
+static void objsteps_clear(void)
+{
+	if (objsteps_us)
+		memset(objsteps_us, 0, OBJSTEPS_DEFINITIONS * sizeof(*objsteps_us));
+	memset(objsteps_definition, 0, sizeof(objsteps_definition));
+	memset(objsteps_type, -1, sizeof(objsteps_type));
+	memset(objsteps_step, 0, sizeof(objsteps_step));
+	objsteps_frames = objsteps_timed_frames = 0;
+	objsteps_deep = 0;
+}
+
+static int objsteps_ready(void)
+{
+	if (objsteps_on < 0)
+	{
+		objsteps_on = psp_keep("objsteps") != 0;
+		if (objsteps_on)
+		{
+			objsteps_us = malloc(OBJSTEPS_DEFINITIONS * sizeof(*objsteps_us));
+			if (!objsteps_us)
+			{
+				platform_log("objsteps: no room for its table (%u KB): off", (unsigned int)(OBJSTEPS_DEFINITIONS * sizeof(*objsteps_us) / 1024));
+				objsteps_on = 0;
+			}
+			else
+				objsteps_clear();
+		}
+	}
+	return objsteps_on;
+}
+
+static void objsteps_charge(const char *step, unsigned int microseconds)
+{
+	long definition;
+	unsigned int row, column, n;
+
+	if (objsteps_depth > OBJSTEPS_DEPTH || !objsteps_us || !step)
+		return;
+	definition = objsteps_stack[objsteps_depth - 1].definition;
+	row = (((unsigned long)definition * 2654435761u) >> 25) % (OBJSTEPS_DEFINITIONS - 1);
+	for (n = 0; n < OBJSTEPS_DEFINITIONS - 1; n++, row = (row + 1) % (OBJSTEPS_DEFINITIONS - 1))
+		if (objsteps_type[row] < 0 || objsteps_definition[row] == definition)
+			break;
+	if (n == OBJSTEPS_DEFINITIONS - 1)
+		row = OBJSTEPS_DEFINITIONS - 1;
+	else if (objsteps_type[row] < 0)
+	{
+		objsteps_definition[row] = definition;
+		objsteps_type[row] = 12; /* unknown until the push names it */
+	}
+	for (column = 0; column < OBJSTEPS_STEPS - 1; column++)
+		if (!objsteps_step[column] || objsteps_step[column] == step)
+			break;
+	if (column < OBJSTEPS_STEPS - 1 && !objsteps_step[column])
+		objsteps_step[column] = step;
+	objsteps_us[row][column][objsteps_stack[objsteps_depth - 1].drawing] += microseconds;
+}
+
+/* the step running so far charged to the object on top, before the stack
+changes */
+static void objsteps_split(void)
+{
+	unsigned int now;
+
+	if (psp_timers_off || !steps_timed || !profile_last_name || !profile_slots)
+		return;
+	now = sceKernelGetSystemTimeLow();
+	profile_slot_for(profile_last_name)->microseconds += now - profile_last_time;
+	if (objsteps_depth > 0)
+		objsteps_charge(profile_last_name, now - profile_last_time);
+	profile_last_time = now;
+}
+
+void psp_objsteps_push(long definition, int type, int drawing)
+{
+	if (!objsteps_ready())
+		return;
+	objsteps_split();
+	if (objsteps_depth < OBJSTEPS_DEPTH)
+	{
+		objsteps_stack[objsteps_depth].definition = definition;
+		objsteps_stack[objsteps_depth].drawing = drawing != 0;
+	}
+	else
+		objsteps_deep++;
+	objsteps_depth++;
+	if (objsteps_depth <= OBJSTEPS_DEPTH && objsteps_us)
+	{
+		/* the type, for the report's rows by type: on the row charge would use */
+		unsigned int row = (((unsigned long)definition * 2654435761u) >> 25) % (OBJSTEPS_DEFINITIONS - 1), n;
+
+		for (n = 0; n < OBJSTEPS_DEFINITIONS - 1; n++, row = (row + 1) % (OBJSTEPS_DEFINITIONS - 1))
+			if (objsteps_type[row] < 0 || objsteps_definition[row] == definition)
+			{
+				objsteps_definition[row] = definition;
+				objsteps_type[row] = (signed char)(type >= 0 && type < 12 ? type : 12);
+				break;
+			}
+	}
+}
+
+void psp_objsteps_pop(void)
+{
+	if (objsteps_on <= 0 || objsteps_depth <= 0)
+		return;
+	objsteps_split();
+	objsteps_depth--;
+}
+
+/* at each map load (psp_showcase_refresh) */
+static void objsteps_map_loaded(void)
+{
+	if (objsteps_on > 0)
+		objsteps_clear();
+	objsteps_depth = 0;
+	memset(objcost, 0, sizeof(objcost));
+}
+
+/* one side of a row: its largest steps, in ms a tick (update) or a frame (draw) */
+static int objsteps_side(char *out, int room, unsigned long (*cells)[2], int drawing, double scale, double per)
+{
+	int length = 0, shown, column;
+	unsigned char taken[OBJSTEPS_STEPS] = { 0 };
+
+	for (shown = 0; shown < 8; shown++)
+	{
+		int best = -1;
+
+		for (column = 0; column < OBJSTEPS_STEPS; column++)
+			if (!taken[column] && cells[column][drawing] && (best < 0 || cells[column][drawing] > cells[best][drawing]))
+				best = column;
+		if (best < 0 || length > room - 64)
+			break;
+		taken[best] = 1;
+		length += snprintf(out + length, room - length, "%s %s %.3f", shown ? "," : "",
+			best == OBJSTEPS_STEPS - 1 ? "(other steps)" : objsteps_step[best] ? objsteps_step[best] : "?",
+			per > 0.0 ? cells[best][drawing] * scale / 1000.0 / per : 0.0);
+	}
+	return length;
+}
+
+static void objsteps_report(SceUID file, unsigned long frames, unsigned long ticks)
+{
+	static const char *const types[13] = { "biped", "vehicle", "weapon", "equipment", "garbage", "projectile", "scenery",
+		"machine", "control", "light", "placeholder", "sound scenery", "?" };
+	static unsigned long by_type[13][OBJSTEPS_STEPS][2];
+	static char line[1024];
+	double scale = objsteps_timed_frames ? (double)objsteps_frames / objsteps_timed_frames : 1.0;
+	unsigned char listed[OBJSTEPS_DEFINITIONS] = { 0 };
+	int shown, row, length, column;
+
+	if (objsteps_on <= 0 || !objsteps_us || !(frames || ticks))
+		return;
+	length = snprintf(line, sizeof(line), "\nobjsteps (ms a tick updating | ms a frame drawing, by step, the costliest definitions first; %lu of %lu frames timed, %lu pushes past %d deep):\n",
+		objsteps_timed_frames, objsteps_frames, objsteps_deep, OBJSTEPS_DEPTH);
+	if (file >= 0)
+		sceIoWrite(file, line, length);
+	platform_log("%.*s", length - 2, line + 1);
+	for (shown = 0; shown < 16; shown++)
+	{
+		int best = -1;
+		double best_cost = 0.0;
+
+		for (row = 0; row < OBJSTEPS_DEFINITIONS; row++)
+		{
+			double cost = 0.0;
+
+			if (listed[row] || objsteps_type[row] < 0)
+				continue;
+			for (column = 0; column < OBJSTEPS_STEPS; column++)
+				cost += (ticks ? objsteps_us[row][column][0] / (double)ticks : 0.0) + (frames ? objsteps_us[row][column][1] / (double)frames : 0.0);
+			if (cost > best_cost)
+			{
+				best = row;
+				best_cost = cost;
+			}
+		}
+		if (best < 0)
+			break;
+		listed[best] = 1;
+		length = snprintf(line, sizeof(line), "objsteps: %s (%s) | tick:", best == OBJSTEPS_DEFINITIONS - 1 ? "(other definitions)" :
+			tag_short_name(objsteps_definition[best]), types[objsteps_type[best] >= 0 && objsteps_type[best] <= 12 ? objsteps_type[best] : 12]);
+		length += objsteps_side(line + length, sizeof(line) - length, objsteps_us[best], 0, scale, (double)ticks);
+		length += snprintf(line + length, sizeof(line) - length, "; draw:");
+		length += objsteps_side(line + length, sizeof(line) - length, objsteps_us[best], 1, scale, (double)frames);
+		platform_log("%s", line);
+		if (file >= 0 && length < (int)sizeof(line) - 1)
+		{
+			line[length++] = '\n';
+			sceIoWrite(file, line, length);
+		}
+	}
+	/* the rest by type, so the table sums to the whole */
+	memset(by_type, 0, sizeof(by_type));
+	for (row = 0; row < OBJSTEPS_DEFINITIONS; row++)
+		if (!listed[row] && objsteps_type[row] >= 0)
+			for (column = 0; column < OBJSTEPS_STEPS; column++)
+			{
+				by_type[objsteps_type[row]][column][0] += objsteps_us[row][column][0];
+				by_type[objsteps_type[row]][column][1] += objsteps_us[row][column][1];
+			}
+	for (row = 0; row < 13; row++)
+	{
+		int any = 0;
+
+		for (column = 0; column < OBJSTEPS_STEPS; column++)
+			any |= by_type[row][column][0] || by_type[row][column][1];
+		if (!any)
+			continue;
+		length = snprintf(line, sizeof(line), "objsteps: the other %s | tick:", types[row]);
+		length += objsteps_side(line + length, sizeof(line) - length, by_type[row], 0, scale, (double)ticks);
+		length += snprintf(line + length, sizeof(line) - length, "; draw:");
+		length += objsteps_side(line + length, sizeof(line) - length, by_type[row], 1, scale, (double)frames);
+		platform_log("%s", line);
+		if (file >= 0 && length < (int)sizeof(line) - 1)
+		{
+			line[length++] = '\n';
+			sceIoWrite(file, line, length);
+		}
+	}
+	objsteps_clear();
+}
+#endif
+
 /* "particlecensus": particles asked for, by the effect that asked (or, for
 a particle made outside an effect, by the particle), and what became of
 each: made, left out unseen at birth, refused over the budget, thinned out
@@ -1760,6 +2038,9 @@ static void profile_report(double seconds, unsigned long frames, unsigned long t
 	object_report(file, ticks);
 #ifdef PSP_RECON
 	recon_counters_report(file, seconds, frames, ticks);
+#ifdef PSP_TICK_STEPS
+	objsteps_report(file, frames, ticks);
+#endif
 #endif
 	if (file >= 0)
 		sceIoClose(file);
@@ -1796,6 +2077,7 @@ how far the HOME exit got. It answered its question (b90: ARK-4 Kommander's
 Exit, the usual way to quit, never calls the exit callback at all), and
 build 105 gives its descriptor back: b104 run 1 showed the PSP lets the
 game hold only about ten files at once */
+void psp_sleepguard_end(void);
 static int exit_callbacks_registered[3] = { 1, 1, 1 };
 
 /* back to the XMB (or ARK-4's menu), saying why in the log */
@@ -1816,6 +2098,8 @@ static void exit_game(const char *why)
 	PSP_METRICS_ME_EXIT(why);
 	platform_log("%s: exiting", why);
 	log_flush();
+	/* the XMB gets its sleep switch back (psp_sleepguard.c) */
+	psp_sleepguard_end();
 	/* build 89: no texture save here any more. The learned binds are saved
 	during play (psp_tex.c, b88); a save here that half worked (the file
 	truncated, the data never written) would wipe the one saved in play */
@@ -2356,6 +2640,9 @@ int psp_map_generation = 0;
 
 void psp_showcase_refresh(const char *name)
 {
+#if defined(PSP_RECON) && defined(PSP_TICK_STEPS)
+	objsteps_map_loaded();
+#endif
 	psp_map_generation++;
 	if (!psp_keep("showcaseonce"))
 		psp_showcase_map = name && !strcmp(name, "ui") && !psp_keep("noshowcase");
@@ -2483,6 +2770,7 @@ static void phase_mark(const char *map, const char *edge)
 
 	platform_log("phase: %s, %s at game time %ld, frame %lu", map, edge, psp_game_time_peek(), psp_ge_frame_number());
 	psp_phase_cut = 1;
+	PSP_LANE_ARM(); /* "lanetrace" (psp_lanetrace.c): a window of frames from here */
 	if (log_wake >= 0)
 		sceKernelSignalSema(log_wake, 1);
 }
@@ -2858,14 +3146,14 @@ steps in order: the console has no way to wait */
 	if ((ticks_seen == 450 || ticks_seen == 540) && psp_keep("mewaketest"))
 	{
 		void psp_me_wake_test_sleep(void);
-		void psp_me_wake_request(void);
+		void psp_me_wake_test_wake(void);
 
 		if (ticks_seen == 450)
 			psp_me_wake_test_sleep();
 		else
 		{
 			platform_log("mewaketest: the wake");
-			psp_me_wake_request();
+			psp_me_wake_test_wake();
 		}
 	}
 	/* keep.txt's "exitatN": back to the menu at N seconds of game time, so
@@ -3051,6 +3339,12 @@ void psp_frame_account(unsigned long microseconds)
 	psp_phase(0);
 	/* build 126: "frametrace" (psp_frametrace.c) */
 	PSP_METRICS_FRAMETRACE_FRAME(microseconds, ticks, psp_heartbeat_clock() - end_start);
+	{
+		/* "lanetrace" (psp_lanetrace.c) */
+		extern unsigned long psp_ge_frame_number(void);
+
+		PSP_LANE_FRAME_END(psp_ge_frame_number(), (unsigned int)ticks);
+	}
 	psp_last_frame_us = microseconds;
 	frame_count++;
 	steps_frame_edge();
@@ -3104,6 +3398,8 @@ volatile int psp_current_phase = 0;
 void psp_phase(int phase)
 {
 	psp_current_phase = phase;
+	/* "lanetrace" (psp_lanetrace.c) */
+	PSP_LANE(PSP_LANE_PHASE, 0, sceKernelGetSystemTimeLow(), 0, (unsigned int)phase);
 	if (hwprofile_running)
 		halo_profile_phase(phase);
 #ifdef PSP_RECON

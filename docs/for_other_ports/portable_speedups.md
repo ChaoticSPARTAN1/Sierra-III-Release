@@ -31,7 +31,7 @@ What made Sierra-III's campaign faster or smaller without leaning on the PSP's G
 | Thread stacks to measured use (deepest under 11 KB in 38,193 samples; floor 64 → 48 KB) | 48 KB a thread | yes | commit `c23d929` |
 | A multiplayer client that never hosts: co-op and host-only records out | heap ceiling 3,668 → 5,220 KB [E] | yes, for a client | `mp_client_only.md` |
 | Pools sized to measured peaks (actors peak 29 of 256, props 235 of 768, lights 244 of 896 on b137's ladder) | ~430 KB [D] | **no**: a fight past the peak fails to spawn; not shipped | `memory_savings_b137.md` R4 |
-| Free particles capped (the Xbox's 1,024) | 15–39 ms a frame under fire before [M, b35] | **no**: long bursts thin (shipped at b36) | `FIXES_36`, `psp_capacity.h`, keep word `fullparticles` |
+| Free particles capped (the Xbox's 1,024) | 15–39 ms a frame under fire before [M, b35] (the updates; drawing them costs by screen coverage, not count) | **no**: long bursts thin (shipped at b36) | `FIXES_36`, `psp_capacity.h`, keep word `fullparticles` |
 
 ### I/O on slow storage
 

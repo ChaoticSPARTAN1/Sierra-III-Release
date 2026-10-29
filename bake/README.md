@@ -25,7 +25,11 @@ copy to the Memory Stick. Nothing from the game is included here.
   computer if it has 3.9 to 3.14; if not, it offers to download a portable
   Python 3.12 (python-build-standalone's official release, about 25 to 35 MB,
   checked against the SHA-256 the bake carries) into `.python` in this folder.
-  Nothing is installed anywhere else.
+  Nothing is installed anywhere else. The bake keeps what it makes (palettes
+  and re-encoded sounds) in your user cache folder, `halo-psp-bake` in
+  `%LOCALAPPDATA%` on Windows, `~/Library/Caches` on macOS, `~/.cache` on
+  Linux, so baking a new release takes minutes instead of the full time. It
+  says where and how big; deleting it is always safe.
 
 ## Bake in four steps
 

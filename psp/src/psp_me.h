@@ -63,6 +63,7 @@ The ring serves one producer thread, the main CPU's renderer. */
 #define ME_JOB_PERC_RAYS 8 /* "meraysperc": perception's queued rays (actor_perception.c, psp_fixups.py FIXES_122) */
 #define ME_JOB_POSES 9 /* next tick's base poses (objects.c, psp_fixups.py FIXES_131 #poseahead) */
 #define ME_JOB_POINTS 12 /* "mepoints": the frame's particles' and contrail points' physics (point_physics.c, psp_fixups.py FIXES_MEJOBS) */
+#define ME_JOB_VISIBILITY 14 /* "mevis": the frame's visibility again, on the ME, timed and checked (structure_visibility.c, psp_fixups.py mevis_copies; a measurement) */
 #ifdef PSP_RECON
 #define ME_JOB_BUSLOAD 10 /* "mebusN": a memory load on the ME through a tick (psp_me_bus_phase) */
 /* the tick's start (phase 1) and end (phase 0), from psp_phase */

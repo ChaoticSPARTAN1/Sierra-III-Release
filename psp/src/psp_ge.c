@@ -48,6 +48,7 @@ VRAM (16-bit color, 512 pixels a row); the on-screen log lives above them
 #include "psp_paths.h"   /* ms0:/halo or ms0:/halomp, and the maps */
 #include <stdarg.h>
 #include "psp_me.h" /* build 118: psp_on_me, PSP_ME_WORK, the submit/finish jobs */
+#include "psp_lanetrace.h"
 
 void platform_log(const char *format, ...);
 /* build 112: the GE layer logs through ge_log (defined with the deferral's
@@ -555,13 +556,13 @@ int psp_display_release(void);
 extern volatile int psp_ge_enqueued;
 int sceGuFinishId(unsigned int id); /* pspgu: sceGuFinish with the FINISH's id */
 static PSP_MAIN_SIDE void *shot_buffer = NULL; /* the buffer screenshot() reads (the shown frame's) */
-static int stall_force; /* (defined with the stall wrapper) */
+static PSP_MAIN_SIDE int stall_force; /* (defined with the stall wrapper) */
 static int inflight_finish_left = 0; /* geinflight: the list's finish waits for the main CPU */
 /* set by the frame's job itself (its args), so the ME never reads the main
 CPU's words for it: publish each stall address, and serve the ring's jobs
 between records (geinflight) */
 static int replay_inflight = 0;
-static int replay_kinds_on = 0; /* "mekinds" (see defer_replay) */
+static PSP_MAIN_SIDE int replay_kinds_on = 0; /* "mekinds" (see defer_replay) */
 static PSP_MAIN_SIDE unsigned long inflight_frames = 0, inflight_words = 0, inflight_words_most = 0;
 /* the whole frame's words, the parts carried out when the buffer filled
 included (inflight_words counts only what is left at the sync) */
@@ -3669,7 +3670,8 @@ always goes through (stall_force, psp_ge_frame_end). Keep word "stalleach":
 every update passed on, as before */
 #define STALL_BATCH 16
 int __real_sceGeListUpdateStallAddr(int qid, void *stall);
-static int stall_batch = -1, stall_force = 0, stall_pending = 0;
+static int stall_batch = -1, stall_pending = 0;
+static PSP_MAIN_SIDE int stall_force = 0;
 static unsigned long stall_calls = 0, stall_forwarded = 0, stall_timed = 0, stall_timed_us = 0;
 
 /* build 79: "geserial" (and the debug menu): no stall update reaches the GE
@@ -3746,6 +3748,8 @@ static void gebusy_add(unsigned int start, unsigned int now, int kind)
 		gebusy_idle_us += start - gebusy_last_reached;
 	if ((int)(now - start) > 0)
 	{
+		/* "lanetrace" (psp_lanetrace.c): the span on the main CPU's clock */
+		PSP_LANE(PSP_LANE_GE, start, now, (unsigned int)kind, 0);
 		gebusy_us += now - start;
 		if (kind >= 0 && kind < KINDS)
 			gebusy_kind_us[kind] += now - start;
@@ -10723,6 +10727,65 @@ failed (the log names only the first 12 buffers, which see-through parts
 usually take) */
 static unsigned long multi_node_rigid_why[3];
 
+/* "model14" (docs/design_model14.md): an opaque rigid part's vertices as
+14-byte records: u16 uv (the source's s16 + 32768, undone by the texture
+offset), s8 normal with the node in the pad byte the GE skips, s16 position
+on a power-of-two step, the part's own, folded into its model matrix. A
+step that is a power of two keeps the matrix a uniform scale (normals keep
+their direction) and puts shared corners of parts with one step on the same
+lattice point. First-person parts, the sky and see-through parts stay in
+floats: the first are seen closest, the last are read on the CPU */
+static int model14 = -1;
+/* the step's exponent + 128 a converted block (0: float records) */
+static unsigned char converted_step[CONVERTED_BUFFERS];
+/* set by the caller before model_convert: the part must stay in floats */
+static int convert_float_only = 0;
+/* the step of the block model_convert last answered for (0: floats), and of
+the part being drawn */
+static float convert_k = 0.0f, part_k14 = 0.0f;
+static unsigned long model14_parts = 0, model14_vertices = 0, model14_refused = 0;
+/* skinned parts left at 28/32 bytes: what step 3b would take 10 bytes a vertex off */
+static unsigned long model14_skinned_parts = 0, model14_skinned_vertices = 0;
+
+static float step_of(unsigned char code)
+{
+	union { float f; unsigned int u; } k;
+
+	if (!code)
+		return 0.0f;
+	k.u = (unsigned int)(code - 128 + 127) << 23;
+	return k.f;
+}
+
+/* a rigid record's position in the part's own space */
+static const float *record_point(const void *vertices, int v, float *out)
+{
+	const short *q;
+
+	if (part_k14 == 0.0f)
+		return (const float *)((const char *)vertices + 24 * v + 12);
+	q = (const short *)((const char *)vertices + 14 * v + 8);
+	out[0] = q[0] * part_k14;
+	out[1] = q[1] * part_k14;
+	out[2] = q[2] * part_k14;
+	return out;
+}
+
+/* the part's texture scale; a 14-byte part's u16 coordinates read as
+(s + 32768) / 32768, so the offset takes the 32768 back off */
+static void model_tex_scale(float su, float sv)
+{
+	if (part_k14 != 0.0f)
+	{
+		su *= 32768.0f / 32767.0f;
+		sv *= 32768.0f / 32767.0f;
+		sceGuTexScale(su, sv);
+		sceGuTexOffset(-su, -sv);
+	}
+	else
+		sceGuTexScale(su, sv);
+}
+
 /* the model's lighting, from the game (build 22): an ambient colour and up
 to two distant lights, each a colour and the direction its light travels */
 static unsigned int model_ambient = MODEL_LIGHT;
@@ -10771,6 +10834,14 @@ void psp_ge_model_begin(const float *node_matrices, int node_matrix_count, float
 	const float *ambient, int light_count, const float *light0, const float *light1)
 {
 	GE_BENCH_SKIP();
+	/* model14's switch, read on the main CPU before any replay needs it, and
+	written back: the ME only reads it (a lazy read there would write a line
+	the main CPU may also hold) */
+	if (model14 < 0 && !psp_on_me())
+	{
+		model14 = psp_keep("model14");
+		sceKernelDcacheWritebackRange(&model14, sizeof(model14));
+	}
 	if (DEFER_RECORDING() &&
 		defer_model_begin(node_matrices, node_matrix_count, u_scale, v_scale, ambient, light_count, light0, light1))
 		return;
@@ -11012,9 +11083,9 @@ read them again itself and wrote that line under the main CPU's dirty copy,
 and on the PSP Chief drew yellow-orange in a run with the visor on,
 where the emulator's one cache drew him right */
 static struct __attribute__((aligned(64))) reflection_words {
-	int read, specular, env_fp, env_near, env_pixels, env_gain, env_min, chief_visor, chief_visor_gain;
+	int read, specular, env_fp, env_near, env_pixels, env_gain, env_min, chief_visor, chief_visor_gain, sheen, sheen_gain;
 	float specular_power, specular_gain;
-} reflection_words = { 0, 0, 0, 0, 160, 100, 0, 0, 150, 8.0f, 2.0f };
+} reflection_words = { 0, 0, 0, 0, 160, 100, 0, 0, 150, 0, 100, 8.0f, 2.0f };
 static unsigned int part_specular = 0;
 static unsigned long specular_parts = 0;
 
@@ -11531,7 +11602,7 @@ entries it checks, so smaller sweeps cost less each. "sweeplate": at three
 quarters only, as before */
 #define CONVERTED_SWEEP_STEP 256
 static int converted_sweep_mark = CONVERTED_BUFFERS / 4;
-static int converted_sweep_late = -1;
+static PSP_MAIN_SIDE int converted_sweep_late = -1;
 unsigned int psp_geo_generation(const void *ptr);
 
 static void converted_sweep(void)
@@ -11586,10 +11657,20 @@ static struct
 {
 	void *vertices;
 	const unsigned short *indices;
-	int count, uncompressed, index_count, strip, skin;
+	int count, uncompressed, index_count, strip, skin, float_only;
 } converts_wanted[CONVERTS_WANTED];
 static int converts_wanted_count = 0;
 static unsigned long converts_wanted_total = 0, converts_wanted_dropped = 0;
+
+/* a converted block's step (0: float records, or not converted) */
+static float converted_k(const void *vertices)
+{
+	unsigned int slot = ((unsigned int)vertices >> 4) % CONVERTED_BUFFERS, tries = 0;
+
+	while (converted[slot] && converted[slot] != vertices && ++tries < CONVERTED_BUFFERS)
+		slot = (slot + 1) % CONVERTED_BUFFERS;
+	return converted[slot] == vertices ? step_of(converted_step[slot]) : 0.0f;
+}
 
 static void convert_want(void *vertices, int count, int uncompressed, const unsigned short *indices, int index_count,
 	int strip, int skin)
@@ -11612,6 +11693,7 @@ static void convert_want(void *vertices, int count, int uncompressed, const unsi
 	converts_wanted[k].index_count = index_count;
 	converts_wanted[k].strip = strip;
 	converts_wanted[k].skin = skin;
+	converts_wanted[k].float_only = convert_float_only;
 	converts_wanted_count++;
 	converts_wanted_total++;
 }
@@ -11667,8 +11749,8 @@ it is good, nothing is released or moved. The reads the ranking needs go in
 a tally only the ME's side writes (an entry's index; the last two words its
 draws and redirects), folded in at the frame's end once the ME is done. The
 same bytes: the same pixels */
-static int vm_me_on = 0, vm_me_dry = 0;
-static unsigned int *vm_me_tally = NULL;
+static PSP_MAIN_SIDE int vm_me_on = 0, vm_me_dry = 0;
+static PSP_MAIN_SIDE unsigned int *vm_me_tally = NULL;
 /* "mevramdry" (a test, off): the ME's reads go in the tally and the
 ranking as with mevram, so the frame's end uploads and evicts the same, but
 the ME's draws keep reading main RAM. Set against mevram it tells the
@@ -11812,7 +11894,7 @@ models leave 226-365 KB of the room idle. A stream is valid until it is
 written again (its origin moved), freed, or moved by the arena; each of
 those releases its copy (the quarantine covers a list the GE is still
 drawing), so a stale copy is never drawn. The same bytes: the same pixels */
-static int vm_level_on = -1;
+static PSP_MAIN_SIDE int vm_level_on = -1;
 
 /* a level stream just written (built, or its origin moved): its copy, if
 any, no longer holds its bytes */
@@ -12052,6 +12134,10 @@ static int model_convert(void *vertices, int count, int uncompressed, const unsi
 
 	if (skin)
 		*skin = NULL;
+	convert_k = 0.0f;
+	/* read on the main CPU (psp_ge_model_begin); the ME only reads it */
+	if (model14 < 0 && !psp_on_me())
+		model14 = psp_keep("model14");
 	if (converted_sweep_late < 0)
 		converted_sweep_late = psp_keep("sweeplate");
 	if (converted_used >= (converted_sweep_late ? CONVERTED_BUFFERS * 3 / 4 : converted_sweep_mark) &&
@@ -12094,8 +12180,15 @@ static int model_convert(void *vertices, int count, int uncompressed, const unsi
 
 		if (generation == converted_generation[slot])
 		{
+			if (converted_step[slot] && !skin)
+			{
+				/* see-through parts read float records on the CPU */
+				model14_refused++;
+				return 0;
+			}
 			if (skin)
 				*skin = skinned[slot];
+			convert_k = step_of(converted_step[slot]);
 			return 1;
 		}
 		if (PSP_ME_WORK())
@@ -12166,11 +12259,50 @@ static int model_convert(void *vertices, int count, int uncompressed, const unsi
 	if (skin)
 		*skin = part;
 	converted_count++;
+	converted_step[slot] = 0;
+	if (model14 > 0 && part && !uncompressed && !convert_float_only && count > 0)
+	{
+		model14_skinned_parts++;
+		model14_skinned_vertices += (unsigned long)count;
+	}
+	if (model14 > 0 && skin && !part && !uncompressed && !convert_float_only && count > 0)
+	{
+		/* the smallest power of two that keeps every coordinate in 16 bits */
+		float largest = 0.0f, k = 1.0f / 16777216.0f;
+		int e = -24;
+
+		for (index = 0; index < count; index++)
+		{
+			const float *p = (const float *)((const unsigned char *)vertices + 32 * index);
+			int axis;
+
+			for (axis = 0; axis < 3; axis++)
+			{
+				float a = p[axis] < 0.0f ? -p[axis] : p[axis];
+
+				if (a > largest)
+					largest = a;
+			}
+		}
+		while (largest > 32767.0f * k && e < 24)
+		{
+			k *= 2.0f;
+			e++;
+		}
+		if (largest <= 32767.0f * k)
+		{
+			converted_step[slot] = (unsigned char)(e + 128);
+			convert_k = k;
+			model14_parts++;
+			model14_vertices += (unsigned long)count;
+		}
+	}
 	for (index = 0; index < count; index++)
 	{
 		unsigned char *vertex = (unsigned char *)vertices + 32 * index;
 		float position[3], uv[2];
 		unsigned int nodes, packed_normal = 0;
+		short texcoord[2] = { 0, 0 };
 
 		if (uncompressed)
 		{
@@ -12193,8 +12325,6 @@ static int model_convert(void *vertices, int count, int uncompressed, const unsi
 		}
 		else
 		{
-			short texcoord[2];
-
 			memcpy(position, vertex, 12);
 			memcpy(&packed_normal, vertex + 12, 4);
 			memcpy(texcoord, vertex + 24, 4);
@@ -12227,6 +12357,29 @@ static int model_convert(void *vertices, int count, int uncompressed, const unsi
 				record[uv_at + 11] = 0;
 				memcpy(record + uv_at + 12, position, 12);
 			}
+			else if (convert_k != 0.0f)
+			{
+				/* the 14-byte record; record i ends before vertex i + 1 starts */
+				unsigned char *record = (unsigned char *)vertices + 14 * index;
+				unsigned short u16[2];
+				short q[3];
+				float inverse = 1.0f / convert_k;
+
+				u16[0] = (unsigned short)(texcoord[0] + 32768);
+				u16[1] = (unsigned short)(texcoord[1] + 32768);
+				for (k = 0; k < 3; k++)
+				{
+					float v = position[k] * inverse;
+					int r = (int)(v < 0.0f ? v - 0.5f : v + 0.5f);
+
+					q[k] = (short)(r < -32767 ? -32767 : r > 32767 ? 32767 : r);
+				}
+				memcpy(record, u16, 4);
+				for (k = 0; k < 3; k++)
+					record[4 + k] = (unsigned char)(signed char)(normal[k] * 127.0f);
+				record[7] = (unsigned char)(nodes & 0xFF);
+				memcpy(record + 8, q, 6);
+			}
 			else
 			{
 				/* 24 bytes: texture coordinate, an 8-bit normal and the first
@@ -12256,8 +12409,12 @@ static int model_convert(void *vertices, int count, int uncompressed, const unsi
 			batch_sphere(&part->batches[b], part, vertices);
 	}
 	free(node0);
-	ge_writeback(vertices, count * (part ? part->stride : 24));
-	vm_note(vertices, (unsigned int)count * (part ? part->stride : 24)); /* build 116: vrammodels */
+	{
+		int stride = part ? part->stride : convert_k != 0.0f ? 14 : 24;
+
+		ge_writeback(vertices, count * stride);
+		vm_note(vertices, (unsigned int)(count * stride)); /* vrammodels: a copy may go to VRAM */
+	}
 	return 1;
 }
 
@@ -12313,7 +12470,7 @@ list, in every pass). Their floats are staged in the scratchpad: written and
 read back for every model part cut at the near plane, and the emulator's
 cache model counted 0.8 M misses on them over b30's beach fight when they
 were in main memory */
-static float (*model_cut)[CORNER_FLOATS];
+static PSP_MAIN_SIDE float (*model_cut)[CORNER_FLOATS];
 
 void *psp_scratch_take(unsigned int bytes, const char *what); /* psp_scratch.c */
 /* at start, with keep.txt read: the cutting's words, and the scratchpad's buffer */
@@ -12444,14 +12601,14 @@ void *psp_vertex_lock(const struct vertex_buffer *buffer);
 void *psp_index_lock(const struct triangle_buffer *buffer);
 /* read by the fixups: whether to offer objects, every type or scenery only,
 the object offered (NONE, -1, none), and the walk's marks */
-int psp_rso_on = 0, psp_rso_all = 0;
-long psp_rso_object = -1;
-int psp_rso_volatile = 0, psp_rso_capturing = 0;
+PSP_MAIN_SIDE int psp_rso_on = 0, psp_rso_all = 0;
+PSP_MAIN_SIDE long psp_rso_object = -1;
+PSP_MAIN_SIDE int psp_rso_volatile = 0, psp_rso_capturing = 0;
 /* models.c: the key's field where a compare found the inputs changed (0 the
 header, 1 regions, 2 ambient, 3 distant lights, 4 reflection tint, 5 centroid,
 6 radius, 7 change colours, 8 node matrices, 9 the length; 10, here: a
 camera-faded reflection's fraction) */
-int psp_rso_field = 0;
+PSP_MAIN_SIDE int psp_rso_field = 0;
 static PSP_MAIN_SIDE int rso_check = 0, rso_room_tried = 0;
 static PSP_MAIN_SIDE unsigned int *rso_pool = NULL, rso_pool_words = 0, rso_end = 0, rso_entries = 0;
 static PSP_MAIN_SIDE unsigned int rso_slot_entry[RSO_SLOTS]; /* an entry's offset + 1; 0 none */
@@ -13063,7 +13220,7 @@ static unsigned long reflection_parts = 0, reflection_cubes_known = 0;
 
 static void reflection_keeps(void);
 /* Chief's visor gets the reflection pass wherever he is drawn at least 24
-pixels across, at chiefvisorgainN percent (150): a restoration, one of the
+pixels across, at chiefvisorgainN percent (150: beside the PC's c40 close-ups, the nearest in brightness): a restoration, one of the
 campaign's defaults (psp_platform.c; "nochiefvisor" turns it off). On the
 Xbox the visor's gold is its cube map's, added over a near-black base:
 folded into the lighting it can't show, since the GE's ambient stops at 1
@@ -13201,6 +13358,11 @@ static void reflection_keeps(void)
 	reflection_words.env_min = psp_keep_number("envmin", 0);
 	reflection_words.chief_visor = psp_keep("chiefvisor");
 	reflection_words.chief_visor_gain = psp_keep_number("chiefvisorgain", 150);
+	reflection_words.sheen = psp_keep("chiefsheen");
+	reflection_words.sheen_gain = psp_keep_number("sheengain", 70);
+	if (reflection_words.sheen)
+		platform_log("GE: chiefsheen: Chief's armour gets the Xbox's reflection added over it by its mask, gain %d%%",
+			reflection_words.sheen_gain);
 	if (reflection_words.chief_visor)
 		platform_log("GE: chiefvisor: Chief's visor drawn with its reflection pass, gain %d%%",
 			reflection_words.chief_visor_gain);
@@ -13421,7 +13583,7 @@ static void __attribute__((noinline, cold)) model_detail_pass(void *vertices, co
 	sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
 	sceGuTexWrap(GU_REPEAT, GU_REPEAT);
 	/* on the part's own coordinates, as the base: times the vertices' scale */
-	sceGuTexScale(model_u_scale * model_detail_u, model_v_scale * model_detail_v);
+	model_tex_scale(model_u_scale * model_detail_u, model_v_scale * model_detail_v);
 	if (bias)
 		sceGuTexLevelMode(tex_level_mode, tex_bias + bias * 0.25f);
 	sceGuDisable(GU_ALPHA_TEST);
@@ -13478,6 +13640,57 @@ static int change_pass(void *vertices, const unsigned short *indices, long index
 	sceGuDepthMask(GU_FALSE);
 	sceGuDepthFunc(GU_GEQUAL);
 	sceGuTexEnvColor(0xFFFFFFFF);
+	return 1;
+}
+
+/* "chiefsheen" (a restoration, on by default): the Xbox adds a shiny part's
+reflection over its lit, change-coloured base, by the multipurpose map's
+red (the reflection mask). Folded into the ambient light, as every other
+part's is, it is multiplied by the base instead, so Chief's armour stayed
+the base's saturated green; added, the environment's grey brightens and
+greys the plates the mask marks, as on the Xbox. The cube map's average
+stands for the cube (no view dependence); the visor keeps its own pass */
+static unsigned long sheen_passes = 0;
+extern const void *psp_tex_reflection_mask(unsigned int key, int *count);
+
+static int sheen_pass(void *vertices, const unsigned short *indices, long index_count, int strip,
+	struct skin_part *skin, ScePspFMatrix4 *model)
+{
+	float cube[3] = { REFLECTION_CUBE_DEFAULT, REFLECTION_CUBE_DEFAULT, REFLECTION_CUBE_DEFAULT };
+	float gain = (float)reflection_words.sheen_gain * (1.0f / 100.0f);
+	unsigned int cube_abgr, color;
+	const void *mask;
+	int count;
+
+	if (!psp_tex_bind(change_key, NULL) || !(mask = psp_tex_reflection_mask(change_key, &count)))
+		return 0;
+	if (reflection_cube_key && psp_tex_average_known(reflection_cube_key, &cube_abgr))
+	{
+		cube[0] = (float)(cube_abgr & 0xFF) * (1.0f / 255.0f);
+		cube[1] = (float)((cube_abgr >> 8) & 0xFF) * (1.0f / 255.0f);
+		cube[2] = (float)((cube_abgr >> 16) & 0xFF) * (1.0f / 255.0f);
+	}
+	color = 0xFF000000u |
+		((unsigned int)PSP_CLAMP_255((int)(reflection_rgb[2] * cube[2] * gain * 255.0f)) << 16) |
+		((unsigned int)PSP_CLAMP_255((int)(reflection_rgb[1] * cube[1] * gain * 255.0f)) << 8) |
+		(unsigned int)PSP_CLAMP_255((int)(reflection_rgb[0] * cube[0] * gain * 255.0f));
+	sceGuClutMode(GU_PSM_8888, 0, 0xFF, 0);
+	sceGuClutLoad(count / 8, mask);
+	sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGB);
+	sceGuColor(color);
+	sceGuDisable(GU_ALPHA_TEST);
+	sceGuDepthFunc(GU_EQUAL);
+	sceGuDepthMask(GU_TRUE);
+	/* added light fades to nothing in the fog */
+	sceGuFog(fog_near, fog_far, 0xFF000000);
+	sceGuBlendFunc(GU_ADD, GU_FIX, GU_FIX, 0xFFFFFF, 0xFFFFFF);
+	ge_blend(1);
+	model_geometry(vertices, indices, index_count, strip, skin, model);
+	ge_blend(0);
+	sceGuFog(fog_near, fog_far, fog_color);
+	sceGuDepthMask(GU_FALSE);
+	sceGuDepthFunc(GU_GEQUAL);
+	sceGuColor(0xFFFFFFFF);
 	return 1;
 }
 
@@ -14414,7 +14627,8 @@ static void model_geometry(void *vertices, const unsigned short *indices, long i
 	{
 		if (index_count > 0)
 			sceGumDrawArray(strip ? GU_TRIANGLE_STRIP : GU_TRIANGLES,
-				GU_TEXTURE_32BITF | GU_NORMAL_8BIT | GU_VERTEX_32BITF | GU_INDEX_16BIT | GU_TRANSFORM_3D,
+				(part_k14 != 0.0f ? GU_TEXTURE_16BIT | GU_NORMAL_8BIT | GU_VERTEX_16BIT :
+				GU_TEXTURE_32BITF | GU_NORMAL_8BIT | GU_VERTEX_32BITF) | GU_INDEX_16BIT | GU_TRANSFORM_3D,
 				(int)index_count, indices, vertices);
 		if (model_cut_count > 0 && model_cut_vertices)
 			sceGumDrawArray(GU_TRIANGLES, GU_TEXTURE_32BITF | GU_NORMAL_8BIT | GU_VERTEX_32BITF | GU_TRANSFORM_3D,
@@ -14451,11 +14665,11 @@ static int rigid_corner_bits(const void *vertices, unsigned short corner, const 
 {
 	int known = corner < CORNER_VERDICTS ? corner_verdict[corner] : -1, bits;
 	const float *p;
-	float camera_point[3];
+	float camera_point[3], point[3];
 
 	if (known >= corner_stamp && known < corner_stamp + CORNER_STAMP_STEP)
 		return known - corner_stamp;
-	p = (const float *)((const char *)vertices + 24 * corner + 12);
+	p = record_point(vertices, corner, point);
 	camera_point[0] = rigid_rows[0][0] * p[0] + rigid_rows[0][1] * p[1] + rigid_rows[0][2] * p[2] + rigid_rows[0][3];
 	camera_point[1] = rigid_rows[1][0] * p[0] + rigid_rows[1][1] * p[1] + rigid_rows[1][2] * p[2] + rigid_rows[1][3];
 	camera_point[2] = rigid_rows[2][0] * p[0] + rigid_rows[2][1] * p[1] + rigid_rows[2][2] * p[2] + rigid_rows[2][3];
@@ -14606,7 +14820,8 @@ static struct rigid_runs *rigid_runs_for(const void *vertices, const unsigned sh
 			for (c = 0; c < 3; c++)
 			{
 				unsigned short v = strip ? indices[t + c] : indices[3 * t + c];
-				const float *p = (const float *)((const char *)vertices + 24 * v + 12);
+				float point[3];
+				const float *p = record_point(vertices, v, point);
 
 				for (axis = 0; axis < 3; axis++)
 				{
@@ -14621,7 +14836,8 @@ static struct rigid_runs *rigid_runs_for(const void *vertices, const unsigned sh
 			for (c = 0; c < 3; c++)
 			{
 				unsigned short v = strip ? indices[t + c] : indices[3 * t + c];
-				const float *p = (const float *)((const char *)vertices + 24 * v + 12);
+				float point[3];
+				const float *p = record_point(vertices, v, point);
 				float dx = p[0] - slot->spheres[k][0], dy = p[1] - slot->spheres[k][1], dz = p[2] - slot->spheres[k][2];
 				float d = dx * dx + dy * dy + dz * dz;
 
@@ -14676,7 +14892,7 @@ static void psp_ge_draw_model_body(void *vertices, int vertex_count, int uncompr
 	struct skin_part *skin = NULL;
 	unsigned int part_ambient;
 	float shine[3] = { 0.0f, 0.0f, 0.0f };
-	int shiny, env;
+	int shiny, env, sheen, sheen_count;
 
 	alpha_tested &= 1;
 	model_cut_count = 0;
@@ -14693,8 +14909,11 @@ static void psp_ge_draw_model_body(void *vertices, int vertex_count, int uncompr
 		return;
 	}
 	part_start();
+	part_k14 = 0.0f;
+	convert_float_only = model_first_person || in_sky;
 	if (!model_convert(vertices, vertex_count, uncompressed, indices, (int)index_count, strip, &skin))
 		return;
+	part_k14 = convert_k;
 	part_add(4);
 	sceGumMatrixMode(GU_MODEL);
 	if (skin)
@@ -14704,7 +14923,19 @@ static void psp_ge_draw_model_body(void *vertices, int vertex_count, int uncompr
 		/* one node: the first vertex's (stored times three, for the Xbox's
 		vertex shader constants) */
 		node_matrix(vertices, indices, &model);
-		sceGumLoadMatrix(&model);
+		if (part_k14 != 0.0f)
+		{
+			/* the GE reads q / 32768 */
+			ScePspFMatrix4 scaled = model;
+			float s = part_k14 * 32768.0f;
+
+			scaled.x.x *= s; scaled.x.y *= s; scaled.x.z *= s;
+			scaled.y.x *= s; scaled.y.y *= s; scaled.y.z *= s;
+			scaled.z.x *= s; scaled.z.y *= s; scaled.z.z *= s;
+			sceGumLoadMatrix(&scaled);
+		}
+		else
+			sceGumLoadMatrix(&model);
 		part_add(5);
 		if (model_near && !model_first_person &&
 			!rigid_part_whole(vertices, indices, index_count, strip, &model, projection_near * 1.25f))
@@ -14813,16 +15044,40 @@ static void psp_ge_draw_model_body(void *vertices, int vertex_count, int uncompr
 					{
 						const unsigned char *record = (const unsigned char *)vertices + 24 * corner[k];
 						const float *uv = (const float *)record, *p = (const float *)(record + 12);
+						const unsigned char *normal = record + 8;
+						float point[3], ge_uv[2], ge_point[3];
 
+						if (part_k14 != 0.0f)
+						{
+							/* the pieces are drawn through the same scaled matrix and
+							texture offset, so they keep the GE's own units */
+							const unsigned short *t;
+							const short *q;
+							int a;
+
+							record = (const unsigned char *)vertices + 14 * corner[k];
+							t = (const unsigned short *)record;
+							q = (const short *)(record + 8);
+							normal = record + 4;
+							for (a = 0; a < 3; a++)
+							{
+								point[a] = q[a] * part_k14;
+								ge_point[a] = q[a] * (1.0f / 32768.0f);
+							}
+							ge_uv[0] = t[0] * (1.0f / 32768.0f);
+							ge_uv[1] = t[1] * (1.0f / 32768.0f);
+							p = point;
+							uv = ge_uv;
+						}
 						model_to_camera(&model, p, polygon[k]);
 						polygon[k][3] = uv[0];
 						polygon[k][4] = uv[1];
-						polygon[k][5] = (signed char)record[8];
-						polygon[k][6] = (signed char)record[9];
-						polygon[k][10] = (signed char)record[10];
-						polygon[k][7] = p[0];
-						polygon[k][8] = p[1];
-						polygon[k][9] = p[2];
+						polygon[k][5] = (signed char)normal[0];
+						polygon[k][6] = (signed char)normal[1];
+						polygon[k][10] = (signed char)normal[2];
+						polygon[k][7] = part_k14 != 0.0f ? ge_point[0] : p[0];
+						polygon[k][8] = part_k14 != 0.0f ? ge_point[1] : p[1];
+						polygon[k][9] = part_k14 != 0.0f ? ge_point[2] : p[2];
 					}
 					model_cut_count += clip_triangle(polygon, bits[0] | bits[1] | bits[2], &pieces_store);
 				}
@@ -14895,7 +15150,7 @@ static void psp_ge_draw_model_body(void *vertices, int vertex_count, int uncompr
 		sceGuEnable(GU_TEXTURE_2D);
 		sceGuTexFunc(GU_TFX_MODULATE, base_alpha && alpha_tested ? GU_TCC_RGBA : GU_TCC_RGB);
 		sceGuTexWrap(GU_REPEAT, GU_REPEAT);
-		sceGuTexScale(model_u_scale * (u_scale != 0.0f ? u_scale : 1.0f), model_v_scale * (v_scale != 0.0f ? v_scale : 1.0f));
+		model_tex_scale(model_u_scale * (u_scale != 0.0f ? u_scale : 1.0f), model_v_scale * (v_scale != 0.0f ? v_scale : 1.0f));
 		/* lit by the GE from the game's lighting; this is the material colour */
 		sceGuColor(0xFFFFFFFF);
 		if (base_alpha && alpha_tested)
@@ -14916,7 +15171,9 @@ static void psp_ge_draw_model_body(void *vertices, int vertex_count, int uncompr
 		visor_pixels = model_pixels;
 	}
 	env = shiny && env_part(shine);
-	if (textured && model_camouflage <= 0.0f && !in_sky && !env)
+	sheen = shiny && reflection_words.sheen && reflection_chief == 2 && change_key && !env &&
+		psp_tex_reflection_mask(change_key, &sheen_count) != NULL;
+	if (textured && model_camouflage <= 0.0f && !in_sky && !env && !sheen)
 		model_ambient = ambient_with_reflection(base_key);
 	part_specular = shiny && reflection_words.specular > 0 ? 0xFF000000u |
 		((unsigned int)PSP_CLAMP_255((int)(shine[2] * reflection_words.specular_gain * 255.0f)) << 16) |
@@ -15026,6 +15283,8 @@ static void psp_ge_draw_model_body(void *vertices, int vertex_count, int uncompr
 				glow_passes++;
 		}
 	}
+	if (sheen && sheen_pass(vertices, indices, index_count, strip, skin, &model))
+		sheen_passes++;
 	if (env)
 	{
 		static int visor_logged = 0;
@@ -15057,6 +15316,8 @@ static void psp_ge_draw_model_body(void *vertices, int vertex_count, int uncompr
 		sceGuTexScale(1.0f, 1.0f);
 		sceGuDisable(GU_TEXTURE_2D);
 	}
+	if (part_k14 != 0.0f)
+		sceGuTexOffset(0.0f, 0.0f);
 	world_model();
 	model_cut_count = 0;
 	model_cut_vertices = NULL;
@@ -15520,7 +15781,7 @@ static void halo_matrix(const float *node, ScePspFMatrix4 *model)
 
 static void node_matrix(const void *vertices, const unsigned short *indices, ScePspFMatrix4 *model)
 {
-	int node_index = ((const unsigned char *)vertices)[24 * indices[0] + 11] / 3;
+	int node_index = ((const unsigned char *)vertices)[part_k14 != 0.0f ? 14 * indices[0] + 7 : 24 * indices[0] + 11] / 3;
 
 	if (node_index >= model_node_count)
 		node_index = 0;
@@ -16310,6 +16571,7 @@ static void psp_ge_queue_transparent_body(void *vertices, int vertex_count, int 
 	if (!frame_open || index_count < 3 || !vertices || !indices || !model_nodes || model_node_count <= 0 ||
 		vertex_count <= 0 || !model_convert(vertices, vertex_count, uncompressed, NULL, 0, 0, NULL))
 		return;
+	part_k14 = 0.0f;
 	if (transparent_full())
 	{
 		transparent_dropped++;
@@ -23352,7 +23614,11 @@ static void runs_wanted_make(void)
 				near_clusters_make(w->batch, w->skin, w->vertices);
 		}
 		else
+		{
+			part_k14 = converted_k(w->vertices);
 			(void)rigid_runs_for(w->vertices, w->indices, w->index_count, w->strip);
+			part_k14 = 0.0f;
+		}
 		runs_wanted_made++;
 	}
 	runs_wanted_count = 0;
@@ -23603,6 +23869,7 @@ static void frame_end_show(void)
 			{
 				struct skin_part *plan;
 
+				convert_float_only = converts_wanted[k].float_only;
 				model_convert(converts_wanted[k].vertices, converts_wanted[k].count, converts_wanted[k].uncompressed,
 					converts_wanted[k].indices, converts_wanted[k].index_count, converts_wanted[k].strip,
 					converts_wanted[k].skin ? &plan : NULL);
@@ -23867,6 +24134,10 @@ static void frame_end_show(void)
 			frames, draws_this_frame, textured_draws, flat_draws, triangles_this_frame, clipped_this_frame, culled_this_frame,
 			model_draws_this_frame, converted_count, reconverted_count, stream_bytes / 1024, streams_let_go, detail_passes, level_glow_passes,
 			list_peak, display_list_size, clip_peak, MAXIMUM_CUT_CORNERS, camera_forward[0], camera_forward[1], camera_forward[2]);
+		if (model14 > 0)
+			platform_log("GE: model14: %lu parts (%lu vertices, %lu KB less than 24-byte records); see-through asks refused %lu; skinned parts at full size %lu (%lu vertices; 10 bytes less a vertex would free %lu KB)",
+				model14_parts, model14_vertices, model14_vertices * 10 / 1024, model14_refused,
+				model14_skinned_parts, model14_skinned_vertices, model14_skinned_vertices * 10 / 1024);
 		if (arena_state > 0)
 		{
 			platform_log("GE: the copies' arena: %lu of %u KB used, largest free %u KB; let go for room %lu; pieces to the heap %lu (%lu there now), kept off the heap's reserve %lu (tables %lu); compacted %lu times, %lu KB; brought back %lu",
@@ -23879,9 +24150,9 @@ static void frame_end_show(void)
 		platform_log("GE: flares hidden by the level alone %lu (their objects not tested); flarescheck: %lu answers compared, %lu differed",
 			psp_flare_walls_hidden, psp_flare_walls_checked, psp_flare_walls_differed);
 		if (reflection_words.specular > 0 || reflection_words.env_fp > 0 || reflection_words.env_near > 0 ||
-			reflection_words.chief_visor > 0)
-			platform_log("GE: reflections: %lu parts with a specular highlight, %lu reflection passes, %lu without their sphere map in memory; Chief's visor drawn %lu (%lu textured, %lu shiny, last %.0f pixels across)",
-				specular_parts, env_passes, env_unbound, visor_drawn, visor_textured, visor_shiny, visor_pixels);
+			reflection_words.chief_visor > 0 || reflection_words.sheen > 0)
+			platform_log("GE: reflections: %lu parts with a specular highlight, %lu reflection passes, %lu without their sphere map in memory; Chief's visor drawn %lu (%lu textured, %lu shiny, last %.0f pixels across); Chief's sheen passes %lu",
+				specular_parts, env_passes, env_unbound, visor_drawn, visor_textured, visor_shiny, visor_pixels, sheen_passes);
 		if (PSP_DITHERSHIFT && dither_shift > 0)
 		{
 			platform_log("GE: %s: %lu passes dithered at a moved place", dither_shift == 2 ? "dithershiftall" : "dithershift", dither_moves);

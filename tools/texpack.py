@@ -56,7 +56,9 @@ File layout (little endian):
     same texels share their data
   data: per texture, 16-byte aligned: the palette (256 x 2 or 4 bytes), then
     each level swizzled, rows padded to 16 bytes and to 8 rows; then a
-    multipurpose map's change mask (flag 8), 64-byte aligned
+    multipurpose map's change mask (flag 8), 64-byte aligned; Chief's
+    multipurpose maps also keep their reflection mask (flag 32) right before
+    it, so the change mask still ends the data
 """
 import sys, os, struct, argparse, hashlib, io, time
 import numpy as np
@@ -538,12 +540,15 @@ GEL_CUBE_MARK = 0xC0BE         # palette entry 255 of a gel patch that carries i
 GEL_CUBE_FIRST = 7             # the cube's colours from this palette entry on (0 the mean, 1-6 the faces)
 
 
-def cube_patch(m, b, rgb=None, faces=None, cube=None, sphere=None):
+def cube_patch(m, b, rgb=None, faces=None, cube=None, sphere=None, mean=None):
     """a cube map's average colour as an 8 x 8 patch of that one colour,
     under the cube map's own key: the GE draws no cube maps, and a model's
     reflection is folded into its lighting by this average (psp_ge.c,
-    psp_ge_model_reflection). The first face stands for the six (the bitmap's
-    data starts with it), unless rgb gives the colour (a light's gel). A
+    psp_ge_model_reflection), and Chief's sheen is added by it. mean gives
+    it as the six faces' mean (a model reflection's cube, unless
+    --cube-first-face); without it the first face stands for the six (the
+    bitmap's data starts with it), unless rgb gives the colour (a light's
+    gel). A
     gel's six face colours, when given, sit in palette entries 1-6 (every
     texel is entry 0, so the patch still draws and averages as one colour),
     entry 15 marking them. A gel's cube, when given, makes the patch CLUT8
@@ -552,6 +557,8 @@ def cube_patch(m, b, rgb=None, faces=None, cube=None, sphere=None):
     still entry 0's"""
     if rgb is not None:
         r, g, bl = rgb
+    elif mean is not None:
+        r, g, bl = mean
     else:
         img = decode(m, b)
         if img is None:
@@ -642,6 +649,7 @@ def sphere_map(m, b):
 
 
 NO_SPHERE_MAPS = False         # --no-sphere-maps: a model reflection's cube as its 8 x 8 average patch only, as before
+CUBE_FIRST_FACE = False        # --cube-first-face: a model reflection's average from its first face, as before
 
 NO_CUBE_PATCHES = False        # --no-cube-patches: no cube map averages in the pack (as build 139)
 NO_GEL_FACES = False           # --no-gel-faces: a gel patch with the single gel average only, the behaviour before per-face averages
@@ -1051,8 +1059,9 @@ def alpha_audit_summary():
               file=sys.stderr)
 # build 102: per-class detail (texpack.py --full-detail fp,vehicles,...):
 # these classes keep their top level (the bake otherwise halves every texture
-# of 64 px and more) and the 256 px cap rises to 512. A lever to try, not the
-# default: each doubles its textures' bytes four times over
+# of 64 px and more) and the 256 px cap rises to 512. Each quadruples its
+# textures' bytes; only Chief is the default (a restoration: his detail map
+# reads on his own textures), the rest are levers to try
 DETAIL_CLASSES = {
     'fp': lambda tag: '\\fp\\' in tag,
     'weapons': lambda tag: tag.startswith('weapons\\') and '\\fp\\' not in tag,
@@ -1061,8 +1070,32 @@ DETAIL_CLASSES = {
     # Chief, a centerpiece as the main menu's ring is: his
     # armour, visor and first-person hands at their own size
     'chief': lambda tag: tag.startswith('characters\\cyborg\\'),
+    # only the detail maps Chief's shaders draw (chief_detail_tags): his base,
+    # multipurpose and glow maps stay halved as every character's are, since
+    # at full size they crowd the level's textures out of the cache
+    'chiefdetail': lambda tag: tag in CHIEF_DETAIL_TAGS,
+    # the rest of Chief (base, multipurpose, glow) at up to 256 a side: twice
+    # the halved objects' 128, a quarter of his own 512's bytes
+    'chief256': lambda tag: tag.startswith('characters\\cyborg\\') and tag not in CHIEF_DETAIL_TAGS,
 }
+# the classes whose cap is below the full-detail 512
+DETAIL_LIMITS = {'chief256': 256}
 FULL_DETAIL = set()
+CHIEF_DETAIL_TAGS = set()
+
+
+def chief_detail_tags(m):
+    """the detail bitmaps of Chief's model shaders (soso, characters\\cyborg\\),
+    from the field the runtime's detail pass reads (psp_fixups.py, definition + 232)"""
+    tags = set()
+    for t in m.tags:
+        if t.group != 'soso' or not t.address or not t.name.startswith('characters\\cyborg\\'):
+            continue
+        detail, = struct.unpack_from('<i', m.data, m.off(t.address) + 232)
+        bitmap = m.by_id.get(detail)
+        if bitmap and bitmap.group == 'bitm':
+            tags.add(bitmap.name)
+    return tags
 
 
 def full_detail(tag):
@@ -1276,7 +1309,7 @@ FAST_PALETTES = False     # --fast-palettes: bitmap_bake.fast_kmeans()
 # what the cache's keys hold besides the pixels: the code that makes the
 # palettes, so a changed bitmap_bake.py never reads an older one's
 with open(bitmap_bake.__file__, 'rb') as _f:
-    PALETTE_CODE = hashlib.sha256(_f.read()).hexdigest()
+    PALETTE_CODE = hashlib.sha256(_f.read() + np.__version__.encode()).hexdigest()
 del _f
 
 
@@ -1853,7 +1886,8 @@ def bake_one(m, b, cls, look=None, model_look=None, full_hud=True, meter=False, 
     if cls == 'objects (soso)' and '\\fp\\' not in b['tag']:
         limit = OBJECT_SIDE
     if FULL_DETAIL and act == 'clut' and full_detail(b['tag']):
-        tw, th, limit = b['w'], b['h'], 512
+        tw, th = b['w'], b['h']
+        limit = min([DETAIL_LIMITS.get(c, 512) for c in FULL_DETAIL if DETAIL_CLASSES[c](b['tag'])] or [512])
     # the showcase: every map at its own size, up to the GE's 512 a side
     if SHOWCASE and act == 'clut' and cls != 'lightmap':
         tw, th, limit = b['w'], b['h'], 512
@@ -2047,6 +2081,7 @@ def bake_one(m, b, cls, look=None, model_look=None, full_hud=True, meter=False, 
 
 CHANGE_MASK_FLAG = 8  # the change mask's CLUT follows the levels
 CPU_READS_FLAG = 16   # the CPU reads this texture's palette: kept in main RAM
+REFL_MASK_FLAG = 32   # the reflection mask's CLUT comes right before the change mask's
 
 
 def change_mask(e):
@@ -2058,6 +2093,16 @@ def change_mask(e):
     w = words.astype(np.uint32)
     blue = (w >> 16) & 0xFF if e['alpha'] else (w >> 11) * 255 // 31
     return (0xFF000000 | (blue << 16) | (blue << 8) | blue).astype('<u4').tobytes()
+
+
+def reflection_mask(e):
+    """a multipurpose map's reflection mask, as the GE's CLUT for Chief's
+    sheen pass (psp_ge.c, sheen_pass): the palette's red (the Xbox's
+    reflection channel) as a grey 8888 word, alpha full"""
+    _, words = read_levels(e)
+    w = words.astype(np.uint32)
+    red = w & 0xFF if e['alpha'] else (w & 0x1F) * 255 // 31
+    return (0xFF000000 | (red << 16) | (red << 8) | red).astype('<u4').tobytes()
 
 
 def runtime_reads(entries):
@@ -2072,8 +2117,11 @@ def runtime_reads(entries):
         if 'multipurpose' in reads and e['psm'] in (4, 5):
             mask = change_mask(e)
             data = bytes(e['data'])
-            e['data'] = data + b'\0' * (-len(data) % 64) + mask
-            e['flags'] = e.get('flags', 0) | CHANGE_MASK_FLAG
+            # Chief's maps (a centerpiece, as the menu's ring) keep their
+            # reflection mask too, for the sheen the Xbox adds over his armour
+            refl = reflection_mask(e) if e.get('name', '').startswith('characters\\cyborg\\') else b''
+            e['data'] = data + b'\0' * (-len(data) % 64) + refl + mask
+            e['flags'] = e.get('flags', 0) | CHANGE_MASK_FLAG | (REFL_MASK_FLAG if refl else 0)
             masks += len(e['data']) - len(data)
         if 'meter' in reads:
             e['flags'] = e.get('flags', 0) | CPU_READS_FLAG
@@ -2115,7 +2163,8 @@ def main():
                          'broken seam spots is treated (0: SEAM_SPOTS_BROKEN, CHART_SPOTS)')
     ap.add_argument('--pgeo', default=None, help='the map\'s geometry pack (default: beside the map) for the lightmap masks')
     ap.add_argument('--alpha-coverage', action='store_true', help='asset track: alpha-tested textures keep their coverage at every level')
-    ap.add_argument('--full-detail', default='', help='classes kept at full size: fp, weapons, vehicles, characters')
+    ap.add_argument('--full-detail', default='chiefdetail,chief256', help='classes kept at full size: fp, weapons, vehicles, characters, chief, chiefdetail, chief256 (the rest of Chief, to 256) '
+                    '(the default: the detail maps of Chief, the centerpiece in every level); none: no class')
     ap.add_argument('--hud-clut4', action='store_true', help='HUD sheets may take 16 colours again (as before build 120)')
     ap.add_argument('--no-clut4-look', action='store_true',
                     help='lightmaps and HUD sheets stay at 8 bits even where 16 colours pass the CLUT4W strict bar '
@@ -2160,6 +2209,8 @@ def main():
                     help="no cube map averages in the pack (as build 139)")
     ap.add_argument('--no-gel-faces', action='store_true',
                     help="a light's gel patch with the single gel average only, the behaviour before per-face averages")
+    ap.add_argument('--cube-first-face', action='store_true',
+                    help="a model reflection cube's average from its first face only, as before (default: the six faces' mean)")
     ap.add_argument('--no-sphere-maps', action='store_true',
                     help="a model reflection's cube map as its average alone, without the sphere map the reflection pass draws")
     ap.add_argument('--no-gel-cube', action='store_true',
@@ -2203,6 +2254,8 @@ def main():
     global NO_RELIEF, OLD_RELIEF, NO_CUBE_PATCHES, NO_GEL_FACES, NO_GEL_CUBE, NO_SPHERE_MAPS
     NO_GEL_FACES = a.no_gel_faces
     NO_SPHERE_MAPS = a.no_sphere_maps
+    global CUBE_FIRST_FACE
+    CUBE_FIRST_FACE = a.cube_first_face
     NO_GEL_CUBE = a.no_gel_cube
     NO_RELIEF = a.no_relief
     OLD_RELIEF = a.relief_unfiltered
@@ -2216,7 +2269,7 @@ def main():
     global CLUT4_LOOK
     # ui.map is the showcase (CLAUDE.md): its packs keep every colour
     CLUT4_LOOK = not a.no_clut4_look and os.path.splitext(os.path.basename(a.map))[0] != 'ui'
-    FULL_DETAIL = set(c for c in a.full_detail.split(',') if c)
+    FULL_DETAIL = set(c for c in a.full_detail.split(',') if c and c != 'none')
     if FULL_DETAIL - set(DETAIL_CLASSES):
         sys.exit('texpack: unknown --full-detail class(es): %s' % ', '.join(sorted(FULL_DETAIL - set(DETAIL_CLASSES))))
     d = Defs()
@@ -2267,6 +2320,10 @@ def main():
     skipped = {}
     looks = level_looks(m, d, B)
     mlooks = model_looks(m, d, B)
+    if FULL_DETAIL & {'chiefdetail', 'chief256'}:
+        CHIEF_DETAIL_TAGS.update(chief_detail_tags(m))
+        print('chiefdetail: %d detail maps kept at full size: %s' % (len(CHIEF_DETAIL_TAGS), ', '.join(sorted(CHIEF_DETAIL_TAGS))),
+              file=sys.stderr)
     reliefs = relief_looks(m, d, B)
     relief_count = 0
     gels = gel_bitmaps(roles)
@@ -2286,7 +2343,17 @@ def main():
             faces = gel_faces(m, b) if rgb is not None and not NO_GEL_FACES else None
             cube = gel_cube(m, b) if faces is not None and not NO_GEL_CUBE else None
             sphere = sphere_map(m, b) if rgb is None and not NO_SPHERE_MAPS else None
-            r = cube_patch(m, b, rgb, faces, cube, sphere)
+            # a model reflection's average over its six faces: its first face
+            # alone (the default before) is one side of the room, and Chief's
+            # cube is warmer and brighter there than the whole
+            mean = gel_average(m, b) if rgb is None and not CUBE_FIRST_FACE else None
+            if mean is not None:
+                first = decode(m, b)
+                if first is not None:
+                    f = [int(round(x)) for x in first[:, :, :3].reshape(-1, 3).astype(np.float64).mean(0)]
+                    print('  reflection cube %s: six faces\' mean %d %d %d (the first face %d %d %d)'
+                          % (b['tag'], mean[0], mean[1], mean[2], f[0], f[1], f[2]), file=sys.stderr)
+            r = cube_patch(m, b, rgb, faces, cube, sphere, mean)
             if r is not None:
                 CUBE_PATCHES.append(b['tag'])
                 if rgb is not None:

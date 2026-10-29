@@ -22,12 +22,17 @@ S10's 11 kHz isn't a rate the sound tag can say (22,050 or 44,100 only), so
 it isn't applied yet: the tag needs the rate per permutation, which the
 runtime doesn't read (audio.md 3b). s10 is accepted and reported as s9.
 
-    python3 soundpack.py TAGS_DIR PROFILE
+    python3 soundpack.py TAGS_DIR PROFILE [CACHE_DIR]
+
+With CACHE_DIR, each tag's re-encode is kept there by a hash of the tag's
+bytes, the profile, this file and numpy's version, and read back by a later
+bake instead of made again (the same bytes either way).
 
 Reads Invader's tag definitions from HALO_PSP_INVADER_DEFINITIONS. Writes
 the sound tags in place and prints a summary (counts and bytes: no tag
 data)."""
 import glob
+import hashlib
 import json
 import os
 import struct
@@ -412,10 +417,53 @@ def bake_sound(d, data, profile, stats):
     return Rewriter(d, data).run(sound, replace, patch)
 
 
+with open(os.path.abspath(__file__), 'rb') as _f:
+    CODE = hashlib.sha256(_f.read() + np.__version__.encode()).hexdigest()
+del _f
+
+
+def cached_bake(d, data, profile, stats, cache):
+    """bake_sound(), or what an earlier bake kept for the same input: the
+    new bytes (or none) and what it added to the summary's counts"""
+    if not cache:
+        return bake_sound(d, data, profile, stats)
+    key = hashlib.sha256(CODE.encode() + profile.encode() + data).hexdigest()
+    path = os.path.join(cache, key)
+    try:
+        with open(path + '.json', encoding='utf-8') as f:
+            kept = json.load(f)
+        new = None
+        if kept['changed']:
+            with open(path + '.bin', 'rb') as f:
+                new = f.read()
+        for k, v in kept['stats'].items():
+            stats[k] = stats[k] + v
+        return new
+    except (OSError, ValueError, KeyError):
+        pass
+    before = {k: (list(v) if isinstance(v, list) else v) for k, v in stats.items()}
+    new = bake_sound(d, data, profile, stats)
+    delta = {k: (stats[k][len(before[k]):] if isinstance(v, list) else stats[k] - before[k])
+             for k, v in before.items()}
+    delta['snr'] = [float(x) for x in delta['snr']]
+    try:   # written whole, then renamed, so maps baking side by side read all or nothing
+        if new is not None:
+            with open(path + '.bin.tmp%d' % os.getpid(), 'wb') as f:
+                f.write(new)
+            os.replace(path + '.bin.tmp%d' % os.getpid(), path + '.bin')
+        with open(path + '.json.tmp%d' % os.getpid(), 'w', encoding='utf-8') as f:
+            json.dump({'changed': new is not None, 'stats': delta}, f)
+        os.replace(path + '.json.tmp%d' % os.getpid(), path + '.json')
+    except OSError:
+        pass
+    return new
+
+
 def main():
-    if len(sys.argv) != 3 or sys.argv[2] not in ('s9', 's10'):
+    if len(sys.argv) not in (3, 4) or sys.argv[2] not in ('s9', 's10'):
         sys.exit(__doc__)
     folder, profile = sys.argv[1], sys.argv[2]
+    cache = sys.argv[3] if len(sys.argv) == 4 else ''
     d = Definitions(os.environ['HALO_PSP_INVADER_DEFINITIONS'])
     stats = {'changed': 0, 'kept': 0, 'other format': 0, 'mono': 0, 'half rate': 0, 'failed': 0,
              'bytes before': 0, 'bytes after': 0, 'snr': []}
@@ -423,7 +471,7 @@ def main():
     for path in paths:
         data = open(path, 'rb').read()
         try:
-            new = bake_sound(d, data, profile, stats)
+            new = cached_bake(d, data, profile, stats, cache)
         except Exception as e:  # a tag this can't read is left as it was
             stats['failed'] += 1
             print('soundpack: %s left as it was: %s' % (os.path.relpath(path, folder), e), file=sys.stderr)

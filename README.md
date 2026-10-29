@@ -6,7 +6,7 @@ Native PlayStation Portable port of Halo: Combat Evolved, built for the original
 
 ## Where it stands
 
-**Build 147h** is the current release. The whole campaign loads and plays on a PSP-1000, all ten maps in one session, and it is a work in progress. Measured on a PSP-1000 just before b143, the first release (b147h is the same or faster; the second half of each level's first two minutes, fights included): *The Maw* and *Assault on the Control Room* run at about 30 fps, *Two Betrayals* at 26, *The Pillar of Autumn* at 20, five more between 13 and 18, and the heaviest, *The Silent Cartographer*, at about 6. The engine base is ChupathingyCE. The release's notes are `docs/release_notes_b147h.md`.
+**Build 148** is the current release. The whole campaign loads and plays on a PSP-1000, all ten maps in one session, and it is a work in progress. Measured on a PSP-1000 just before b143, the first release (b148 is the same or faster; the second half of each level's first two minutes, fights included): *The Maw* and *Assault on the Control Room* run at about 30 fps, *Two Betrayals* at 26, *The Pillar of Autumn* at 20, five more between 13 and 18, and the heaviest, *The Silent Cartographer*, at about 6. The engine base is ChupathingyCE. The release's notes are `docs/release_notes_b148.md`.
 
 The target is a steady 30 ticks a second at 30 fps everywhere in the campaign. Most levels are still short of it.
 
@@ -14,7 +14,7 @@ The target is a steady 30 ticks a second at 30 fps everywhere in the campaign. M
 
 You need a PSP with custom firmware (ARK-4) and a Memory Stick with 3.5 GB free; your own disc image of Halo for the original Xbox (Tested against NTSC version 01.10.12.2276); and a Windows 10 or 11 PC, or a Linux PC with glibc 2.39 or later, to bake the maps on.
 
-1. **Download** from the [releases page](https://github.com/Sheepdog-01/Sierra-III-Release/releases) the game zip (`halo_psp_b147h.zip`) and the bake tool for your PC.
+1. **Download** from the [releases page](https://github.com/Sheepdog-01/Sierra-III-Release/releases) the game zip (`halo_psp_b148.zip`) and the bake tool for your PC.
 2. **Unpack the bake tool**, then put your disc image and the game zip, unopened, in the two folders it names.
 3. **Double-click the bake** (`Bake Halo.cmd` on Windows, `bake-halo.sh` on Linux). It checks your disc, then bakes the maps in about 10 minutes on an 8-core PC.
 4. **Copy what it made** (`COPY-TO-MEMORY-STICK`) onto the Memory Stick's root, merging with what is there.

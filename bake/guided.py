@@ -495,6 +495,37 @@ def run_bake(screen, launcher, command, maps, temp):
 
 # --- the whole of it ----------------------------------------------------------
 
+def cache_choice(screen, named, extra):
+    """[] or ['--cache-dir', DIR]: the bake keeps palettes and sounds in the
+    user's cache folder (bake.py, default_cache_root), so a re-bake after a
+    new release takes minutes. When that folder holds nothing yet, ask once
+    whether there's a cache from another computer or folder to use instead;
+    never in a named run, with HALO_PSP_BAKE_YES, or without a console"""
+    if named or YES or not sys.stdin.isatty() or '--cache-dir' in extra or '--no-cache' in extra:
+        return []
+    sys.path.insert(0, HERE)
+    try:
+        import bake
+        root = bake.default_cache_root()
+    except Exception:
+        return []
+    if os.path.isdir(os.path.join(root, 'palettes')) and os.listdir(os.path.join(root, 'palettes')):
+        screen.say('Reusing earlier bakes\' results from %s: a re-bake takes minutes.' % root)
+        return []
+    screen.say('This bake keeps what it makes in %s, so the next one takes minutes.' % root)
+    try:
+        answer = input('Baked before on another computer or kept a cache elsewhere? Type its folder, '
+                       'or press Enter to go on: ').strip().strip('"')
+    except (EOFError, KeyboardInterrupt):
+        return []
+    if answer and os.path.isdir(os.path.join(answer, 'palettes')):
+        screen.say('Using the cache in %s.' % answer)
+        return ['--cache-dir', answer]
+    if answer:
+        screen.say('%s holds no bake cache (no palettes folder): going on with %s.' % (answer, root))
+    return []
+
+
 def wait_for_enter():
     if YES or not sys.stdin.isatty():
         return
@@ -709,7 +740,7 @@ def bake_all(screen, launcher, named, disc_arg, zip_arg, maps_arg, keep, extra, 
         command += ['--sound', SOUND]
     if eboot:
         command += ['--eboot', eboot]
-    command += extra
+    command += extra + cache_choice(screen, named, extra)
     screen.say('[3/4] Baking %d maps: this is the long part. Leave this window open.' % len(maps))
     code, progress, notes, peak = run_bake(screen, launcher, command, maps, temp)
     screen.detail('the most disk the bake used: %s; per map: %s' % (size_text(peak), ', '.join(

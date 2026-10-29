@@ -14,7 +14,7 @@ holding the made-up maps' hashes. Then:
   - each input mistake (nothing there, two things, not a disc image, an
     archive, a map that isn't the retail one, no zip) ends in its plain
     sentence, before anything is set up;
-  - a bake from a disc image and the zip (bake.py's MUSIC as shipped: no
+  - a bake from a disc image and the zip (bake.py's MUSIC set to none: no
     clip chosen, so the menu sound's soft warning) puts the zip's files, the
     EBOOT and every map in COPY-TO-MEMORY-STICK;
   - a bake from a folder of the disc's files and the unpacked release, with
@@ -114,6 +114,11 @@ def stand_in(bundle, folder):
     for name, text in (('soundpack', SOUNDPACK), ('snd0', SND0), ('chant', CHANT)):
         with open(os.path.join(folder, 'lib', name + '.py'), 'w') as f:
             f.write(text)
+    # the first bakes check the path with no clip chosen (the soft warning);
+    # the last chooses one ('stand-in'), whatever bake.py ships with
+    bake_py = os.path.join(folder, 'bake.py')
+    text = open(bake_py, encoding='utf-8').read()
+    open(bake_py, 'w', encoding='utf-8').write(re.sub(r"(?m)^MUSIC = '.*'$", "MUSIC = ''", text))
     rng = random.Random(1)
     maps = {name + '.map': bytes(rng.randrange(256) for _ in range(rng.randrange(4096, 65536))) for name in CAMPAIGN}
     with open(os.path.join(folder, 'hashes.json'), 'w') as f:
@@ -157,6 +162,8 @@ SHELL_TOOLS = ['uname', 'dirname', 'sed', 'cut', 'tar', 'gzip', 'mkdir', 'rm', '
 def env(hide_python=False, tools=None):
     e = dict(os.environ)
     e['HALO_PSP_BAKE_YES'] = '1'
+    # the bake's cache in the check's own folder, not the user's
+    e['HALO_PSP_BAKE_CACHE'] = os.path.join(tempfile.gettempdir(), 'halo-psp-bake-check-cache-%d' % os.getpid())
     e.pop('PYTHONPATH', None)
     if hide_python:
         if WINDOWS:
@@ -287,7 +294,7 @@ def main():
             files = release(os.path.join(game, 'halo_psp_b999'), as_folder=True)
             bake_py = os.path.join(bundle, 'bake.py')
             text = open(bake_py, encoding='utf-8').read()
-            open(bake_py, 'w', encoding='utf-8').write(re.sub(r"(?m)^MUSIC = ''$", "MUSIC = 'stand-in'", text))
+            open(bake_py, 'w', encoding='utf-8').write(re.sub(r"(?m)^MUSIC = '.*'$", "MUSIC = 'stand-in'", text))
             code, said = double_click(bundle)
             assert code == 0, said[-4000:]
             n = check_output(bundle, maps, files, sound=True)
