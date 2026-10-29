@@ -156,12 +156,23 @@ int psp_sleepguard_quiet(void)
 	return quiet;
 }
 
-/* the power callback's wake half, done. A sleep this file didn't ready (one
-the firmware didn't hold back for the refusal) leaves no press behind */
+/* the power callback's wake half, first: the game stops being ready before
+anything is taken back. Until the game thread runs again a query would
+otherwise be let through (a request queued behind a second flick), and the
+PSP would sleep again with the partition already taken back (B41's hazard;
+sierra-iii/host-test, press-while-asking) */
+void psp_sleepguard_waking(void)
+{
+	block.ready = 0;
+	quiet = 0;
+}
+
+/* the power callback's wake half, done. No press is left behind: a sleep
+this file didn't ready (one the firmware didn't hold back for the refusal)
+answered it, and a refusal since the wake is the wake's own */
 void psp_sleepguard_woken(void)
 {
-	if (!quiet)
-		block.wanted = 0;
+	block.wanted = 0;
 	woke_at = sceKernelGetSystemTimeWide();
 	woken = 1;
 }

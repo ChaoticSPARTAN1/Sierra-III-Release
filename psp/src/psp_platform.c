@@ -2154,6 +2154,7 @@ void psp_me_wake_request(void);
 void psp_ge_inflight_room_suspend(void);
 void psp_ge_inflight_room_resume(void);
 int psp_sleepguard_quiet(void);
+void psp_sleepguard_waking(void);
 void psp_sleepguard_woken(void);
 
 static int power_callback(int unknown, int flags, void *argument)
@@ -2177,6 +2178,8 @@ static int power_callback(int unknown, int flags, void *argument)
 	}
 	if (flags & PSP_POWER_CB_RESUME_COMPLETE)
 	{
+		/* B41: before anything is taken back, no query is let through */
+		psp_sleepguard_waking();
 		/* first: the files the game streams from died in the sleep, and a
 		thread may already be waiting to read (psp_trace.c) */
 		if (!psp_keep("noreopen"))
