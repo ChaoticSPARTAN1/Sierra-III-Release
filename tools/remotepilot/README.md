@@ -1,17 +1,20 @@
 # RemotePilot for Sierra-III (optional)
 
-[RemotePilot](https://github.com/ChaoticSPARTAN1/RemotePilot) is a local QA
-tool: a viewer that runs on your PC, and a small companion on the device,
-talking over your own Wi-Fi. Nothing here is needed to build or play
-Sierra-III; it is what we used to test the B41 fix (`docs/sleep_b41.md`), and
-it can save you time on a PSP. Its PSP section (`psp/` there) has the
-companion's source, the viewer and the tests.
+[RemotePilot](https://github.com/ChaoticSPARTAN1/RemotePilot) is a small,
+free, local QA tool: a viewer that runs on your PC and a companion app on the
+PSP, talking over your own Wi-Fi. Nothing here is needed to build or play
+Sierra-III. It's what we used while testing the B41 fix (`docs/sleep_b41.md`),
+and we hope it saves you some time on a PSP too. Its PSP section (`psp/`
+there) has the companion's source, the viewer and the tests.
 
-This folder holds the viewer's preset for Sierra-III, `psp-hce/`
+This folder holds a viewer preset made for Sierra-III, `psp-hce/`
 (`manifest.json`, `adapter.py`): copy it into RemotePilot's
-`psp/pc/presets/`. It holds no address, pairing or personal setting: each
-viewer makes its own pairing (below). The two files are MIT, as RemotePilot's
-viewer is.
+`psp/pc/presets/`, next to its generic PSP preset. It holds no address,
+pairing or personal setting: each viewer makes its own pairing (below). These
+files are contributed under Sierra-III's own licence (`LICENSE`).
+
+RemotePilot is an independent project, not affiliated with or endorsed by
+Sony Interactive Entertainment, Microsoft, Halo Studios or Bungie.
 
 ## What it gives you on a PSP
 
@@ -26,10 +29,13 @@ XMB), with guided screens on the console:
   after any test that could touch them (a sleep test, a crash).
 - **Settings restore** (□): a backup put back after a reset. It checks the
   copies against their manifest and the firmware first, shows what differs,
-  needs ✕ held for two seconds on the console, writes only what differs
-  (through a small kernel helper that writes nowhere but flash1 and reads
-  from nowhere but the backup folder), reads each file back, and restarts the
-  PSP. Nothing on the network can start a restore.
+  needs ✕ held for two seconds on the console, backs up the settings as they
+  are now, then writes only what differs (through a small kernel helper that
+  writes only flash1's settings folders and reads only from the backup
+  folder), checks each file and restarts the PSP. Nothing on the network can
+  start a restore. **Not yet run on hardware**: it has been tested on
+  RemotePilot's simulator only, so until then please keep a copy of your
+  backup on a PC as well.
 - **Wi-Fi check:** the WLAN switch read live (with a strip that shows a worn
   switch's flicker), the chip, the saved network, a join test with every
   step's time and the firmware's error codes, and a report on the stick.
@@ -52,13 +58,13 @@ XMB), with guided screens on the console:
 ## Setting it up
 
 1. Get RemotePilot (its README), and copy `psp-hce/` into
-   `psp/pc/presets/` (RemotePilot already has it in its PSP section).
-2. Build RemotePilot PSP (`psp/tools/build_psp.py`) and copy its `EBOOT.PBP`
-   and `rp_flash.prx` to `ms0:/PSP/GAME/REMOTEPILOT/`.
+   `psp/pc/presets/`.
+2. Build RemotePilot PSP (`psp/tools/build_psp.py`) and copy its `EBOOT.PBP`,
+   `rp_flash.prx` and `licenses/` to `ms0:/PSP/GAME/REMOTEPILOT/`.
 3. Start the viewer, choose **PSP · Halo CE (Sierra-III)**, and follow its
    guide: **Prepare pairing**, then copy the pairing file it writes to the
-   stick as `halo/remotepilot.cfg`. The file is a private 256-bit key: keep it
-   out of bug reports and repositories.
+   stick as `remotepilot/remotepilot.cfg`. The file is a private 256-bit key:
+   keep it out of bug reports and repositories.
 4. On the PSP: WLAN switch on, start RemotePilot PSP, ✕ Connect. It joins
    the first network saved in Settings > Network Settings and shows its
    address; the viewer finds it on your network by itself.

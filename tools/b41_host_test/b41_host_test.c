@@ -11,7 +11,7 @@ the volatile partition and the records' room given back.
 
 The model is not the PSP. What the firmware does after a refused query, and
 whether a held switch asks the same query, are only known from hardware
-logs (docs/B41-TEST.md). This test shows the code does what it was designed
+logs (docs/sleep_b41.md). This test shows the code does what it was designed
 to on every path the design names.
 
 Each scenario runs in its own process (the sources keep their state in

@@ -5,12 +5,53 @@
   "mark": "PSP",
   "transport": "python-v1",
   "status": "hardware-validation-needed",
-  "capabilities": ["screenshot", "stream", "controller", "input", "report", "log", "perf", "files", "backup"],
-  "display": {"layout": "psp", "width": 480, "height": 272},
-  "buttons": ["CROSS", "CIRCLE", "SQUARE", "TRIANGLE", "UP", "DOWN", "LEFT", "RIGHT", "L", "R", "START", "SELECT"],
-  "buttonBits": {"CROSS": 0, "CIRCLE": 1, "SQUARE": 2, "TRIANGLE": 3, "L": 4, "R": 5, "SELECT": 8, "START": 9,
-                 "UP": 12, "DOWN": 13, "LEFT": 14, "RIGHT": 15},
-  "setup": {"deviceConfigPath": "ms0:/halo/remotepilot.cfg"},
+  "capabilities": [
+    "screenshot",
+    "stream",
+    "controller",
+    "input",
+    "report",
+    "log",
+    "perf",
+    "files",
+    "backup"
+  ],
+  "display": {
+    "layout": "psp",
+    "width": 480,
+    "height": 272
+  },
+  "buttons": [
+    "CROSS",
+    "CIRCLE",
+    "SQUARE",
+    "TRIANGLE",
+    "UP",
+    "DOWN",
+    "LEFT",
+    "RIGHT",
+    "L",
+    "R",
+    "START",
+    "SELECT"
+  ],
+  "buttonBits": {
+    "CROSS": 0,
+    "CIRCLE": 1,
+    "SQUARE": 2,
+    "TRIANGLE": 3,
+    "L": 4,
+    "R": 5,
+    "SELECT": 8,
+    "START": 9,
+    "UP": 12,
+    "DOWN": 13,
+    "LEFT": 14,
+    "RIGHT": 15
+  },
+  "setup": {
+    "deviceConfigPath": "ms0:/remotepilot/remotepilot.cfg"
+  },
   "theme": {
     "background": "#06101d",
     "surface": "#10223a",

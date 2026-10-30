@@ -1,6 +1,6 @@
 #ifndef HOST_PSPSYSEVENT_H
 #define HOST_PSPSYSEVENT_H
-/* the PSPSDK's layout */
+/* the PSPSDK's layout (pspsysevent.h, PSPSDK, BSD licence): the declaration only */
 typedef struct PspSysEventHandler
 {
 	int size;

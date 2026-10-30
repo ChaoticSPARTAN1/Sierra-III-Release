@@ -49,7 +49,7 @@ sleeps in a row. gcc (MinGW on Windows) is enough. It found one real hole
 **First, back up the PSP's system settings.** B41 is a settings corruption,
 and a tester's custom theme may exist nowhere else: the PSP keeps its own copy
 in flash1, often the only one left once the original `.ptf` file is gone.
-Either way works:
+Either way works, and the first is the one to rely on:
 
 - **The custom firmware's USB flash1 mount** (ARK-4: the VSH menu's USB
   device, set to Flash 1): connect, copy every file to the PC, read only, and
@@ -60,8 +60,9 @@ Either way works:
   (each file's size and SHA-256). Copy that folder to the PC by card reader or
   over Wi-Fi; RemotePilot's viewer checks each file against the manifest. Its
   □ Restore puts a backup back if a reset ever happens (it checks the backup
-  and the firmware first, needs ✕ held for two seconds on the console, writes
-  only what differs and restarts the PSP).
+  and the firmware first, needs ✕ held for two seconds on the console, backs
+  up the current settings, writes only what differs and restarts the PSP).
+  The restore hasn't been run on hardware yet, so keep the PC copy too.
 
 Then install the build in its own folder, keep the stock one, and copy
 `halo/log/log.txt` off the stick after each step:
@@ -103,6 +104,10 @@ Then install the build in its own folder, keep the stock one, and copy
   apart. A long hold still powers off.
 - After a press, the next frame runs without the Media Engine's frame overlap
   (as the menus do), for one frame, before the sleep.
+- If the game itself hangs, the switch can't sleep the PSP (the module keeps
+  answering "not yet" while the game isn't ready). A long hold of the switch
+  still powers it off, as with b148. A heartbeat that lets the sleep through
+  once the game has stopped answering would be a follow-up.
 
 ## Review
 
